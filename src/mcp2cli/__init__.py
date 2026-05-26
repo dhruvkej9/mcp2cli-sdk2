@@ -469,13 +469,21 @@ OAUTH_DIR = CACHE_DIR / "oauth"
 
 
 class FileTokenStorage:
-    """File-based token storage for OAuth tokens and client info."""
+    """File-based token storage for OAuth tokens and client info.
+
+    Persists an absolute ``expires_at`` timestamp alongside ``tokens.json``
+    (in ``tokens_meta.json``) so that on a fresh process the SDK can tell an
+    access token has expired and trigger a refresh, rather than blindly
+    re-sending the stale Bearer and falling through to a full re-auth that
+    reuses a possibly-forgotten DCR client_id (issue #50).
+    """
 
     def __init__(self, server_url: str):
         key = hashlib.sha256(server_url.encode()).hexdigest()[:16]
         self._dir = OAUTH_DIR / key
         self._dir.mkdir(parents=True, exist_ok=True)
         self._tokens_path = self._dir / "tokens.json"
+        self._tokens_meta_path = self._dir / "tokens_meta.json"
         self._client_path = self._dir / "client.json"
 
     async def get_tokens(self):
@@ -491,6 +499,50 @@ class FileTokenStorage:
 
     async def set_tokens(self, tokens) -> None:
         self._tokens_path.write_text(tokens.model_dump_json())
+        # Persist an absolute expiry timestamp so we can detect on a
+        # later process start that the access token has expired.
+        if tokens.expires_in is not None:
+            try:
+                meta = {"expires_at": time.time() + float(tokens.expires_in)}
+                self._tokens_meta_path.write_text(json.dumps(meta))
+            except Exception:
+                pass
+        else:
+            # No expiry info; drop any stale meta sidecar.
+            try:
+                self._tokens_meta_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def get_expires_at(self) -> float | None:
+        """Return the absolute expiry timestamp persisted alongside tokens.
+
+        Returns None when no sidecar exists (older caches or tokens without
+        an ``expires_in`` value).
+        """
+        if not self._tokens_meta_path.exists():
+            return None
+        try:
+            data = json.loads(self._tokens_meta_path.read_text())
+            value = data.get("expires_at")
+            return float(value) if value is not None else None
+        except Exception:
+            return None
+
+    def clear_tokens(self) -> None:
+        """Remove persisted tokens and their expiry sidecar."""
+        for path in (self._tokens_path, self._tokens_meta_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def clear_client_info(self) -> None:
+        """Remove persisted DCR client info so a fresh registration runs."""
+        try:
+            self._client_path.unlink()
+        except FileNotFoundError:
+            pass
 
     async def get_client_info(self):
         from mcp.shared.auth import OAuthClientInformationFull
@@ -601,6 +653,53 @@ def build_oauth_provider(
     from mcp.client.auth.oauth2 import OAuthClientProvider
     from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata
 
+    class _RobustOAuthClientProvider(OAuthClientProvider):
+        """OAuthClientProvider with cross-process expiry + stale-DCR recovery.
+
+        Fixes for issue #50 — Atlassian "Internal Server Error" on next-day
+        OAuth calls. The upstream SDK has two gaps when state is reloaded
+        from disk in a new process:
+
+        1. ``_initialize`` reloads ``current_tokens`` from storage but never
+           recomputes ``token_expiry_time`` from the bare ``OAuthToken``
+           dump (which only carries ``expires_in``). An expired access
+           token therefore looks valid, is sent, and only the 401 fallback
+           runs — skipping the refresh-token grant entirely.
+
+        2. The 401 fallback re-uses the cached DCR ``client_id`` because
+           ``client_info`` was reloaded from disk; if the auth server has
+           since forgotten that registration, ``/authorize`` returns an
+           opaque 500 page rather than a clean ``invalid_client`` redirect
+           and the CLI hangs on the callback.
+
+        We patch both by restoring ``token_expiry_time`` from a sidecar
+        we persist in :class:`FileTokenStorage`, and by wiping the cached
+        ``client_info`` from disk and memory whenever a refresh fails so
+        the subsequent re-auth performs fresh Dynamic Client Registration.
+        """
+
+        async def _initialize(self) -> None:
+            await super()._initialize()
+            storage = self.context.storage
+            if isinstance(storage, FileTokenStorage) and self.context.current_tokens:
+                expires_at = storage.get_expires_at()
+                if expires_at is not None:
+                    self.context.token_expiry_time = expires_at
+
+        async def _handle_refresh_response(self, response) -> bool:
+            ok = await super()._handle_refresh_response(response)
+            if not ok:
+                # Refresh failed. The cached DCR client_id may have been
+                # forgotten by the auth server too; clear it so the
+                # subsequent 401 fallback performs a fresh registration
+                # instead of /authorize?client_id=<stale> → opaque 500.
+                self.context.client_info = None
+                storage = self.context.storage
+                if isinstance(storage, FileTokenStorage):
+                    storage.clear_client_info()
+                    storage.clear_tokens()
+            return ok
+
     _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
     if redirect_uri is not None:
@@ -700,7 +799,7 @@ def build_oauth_provider(
             raise RuntimeError("No authorization code received")
         return (_CallbackHandler.auth_code, _CallbackHandler.state)
 
-    return OAuthClientProvider(
+    return _RobustOAuthClientProvider(
         server_url=server_url,
         client_metadata=client_metadata,
         storage=storage,

@@ -110,6 +110,196 @@ class TestFileTokenStorage:
 
         anyio.run(_test)
 
+    def test_set_tokens_writes_expires_at_sidecar(self, tmp_path, monkeypatch):
+        """set_tokens persists an absolute expiry timestamp (issue #50)."""
+        import time
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+
+        import anyio
+        from mcp.shared.auth import OAuthToken
+
+        async def _test():
+            before = time.time()
+            token = OAuthToken(
+                access_token="a", token_type="Bearer",
+                refresh_token="r", expires_in=3600,
+            )
+            await storage.set_tokens(token)
+            after = time.time()
+
+            expires_at = storage.get_expires_at()
+            assert expires_at is not None
+            assert before + 3600 - 1 <= expires_at <= after + 3600 + 1
+
+        anyio.run(_test)
+
+    def test_set_tokens_without_expires_in_clears_sidecar(self, tmp_path, monkeypatch):
+        """When expires_in is None, any prior sidecar is removed."""
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        storage._tokens_meta_path.write_text(json.dumps({"expires_at": 1.0}))
+
+        import anyio
+        from mcp.shared.auth import OAuthToken
+
+        async def _test():
+            await storage.set_tokens(
+                OAuthToken(access_token="a", token_type="Bearer")
+            )
+            assert storage.get_expires_at() is None
+            assert not storage._tokens_meta_path.exists()
+
+        anyio.run(_test)
+
+    def test_get_expires_at_missing_sidecar(self, tmp_path, monkeypatch):
+        """Older caches with no sidecar return None (backward-compat)."""
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        assert storage.get_expires_at() is None
+
+    def test_clear_client_info_removes_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        storage._client_path.write_text("{}")
+        storage.clear_client_info()
+        assert not storage._client_path.exists()
+        # Idempotent
+        storage.clear_client_info()
+
+    def test_clear_tokens_removes_token_files(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        storage._tokens_path.write_text("{}")
+        storage._tokens_meta_path.write_text("{}")
+        storage.clear_tokens()
+        assert not storage._tokens_path.exists()
+        assert not storage._tokens_meta_path.exists()
+
+
+class TestRobustOAuthClientProvider:
+    """Behavior of the _RobustOAuthClientProvider subclass (issue #50)."""
+
+    def test_initialize_restores_token_expiry_from_sidecar(self, tmp_path, monkeypatch):
+        """A fresh process restoring tokens picks up the persisted expiry,
+        so an expired access token correctly fails is_token_valid()."""
+        import time
+        import anyio
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+
+        async def _setup():
+            # Persist a token whose expires_in places expiry in the past
+            await storage.set_tokens(
+                OAuthToken(
+                    access_token="stale",
+                    token_type="Bearer",
+                    refresh_token="r",
+                    expires_in=3600,
+                )
+            )
+            # Rewrite the sidecar so expires_at is firmly in the past.
+            storage._tokens_meta_path.write_text(
+                json.dumps({"expires_at": time.time() - 60})
+            )
+
+        anyio.run(_setup)
+
+        provider = mcp2cli.build_oauth_provider(
+            "https://example.com/mcp",
+            redirect_uri="http://localhost:19881/callback",
+        )
+
+        async def _drive():
+            await provider._initialize()
+            # token_expiry_time must be restored (and in the past)
+            assert provider.context.token_expiry_time is not None
+            assert provider.context.token_expiry_time < time.time()
+            # Therefore the access token is not considered valid …
+            assert not provider.context.is_token_valid()
+            # … but refresh is possible because client_info was pre-seeded
+            # by build_oauth_provider's client_id branch? No — without an
+            # explicit client_id we have no client_info yet, so the SDK
+            # would do a full re-auth. The point of this test is the
+            # expiry restoration; a separate test covers DCR recovery.
+
+        anyio.run(_drive)
+
+    def test_initialize_without_sidecar_leaves_expiry_unset(self, tmp_path, monkeypatch):
+        """Backward compat: caches written by older versions (no sidecar)
+        still load — token_expiry_time stays None (legacy behavior)."""
+        import anyio
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        # Write tokens.json directly (no sidecar) — simulates old cache.
+        storage._tokens_path.write_text(
+            OAuthToken(
+                access_token="a", token_type="Bearer",
+                refresh_token="r", expires_in=3600,
+            ).model_dump_json()
+        )
+
+        provider = mcp2cli.build_oauth_provider(
+            "https://example.com/mcp",
+            redirect_uri="http://localhost:19882/callback",
+        )
+
+        async def _drive():
+            await provider._initialize()
+            assert provider.context.current_tokens is not None
+            assert provider.context.token_expiry_time is None
+
+        anyio.run(_drive)
+
+    def test_refresh_failure_clears_client_info(self, tmp_path, monkeypatch):
+        """When a refresh response is non-2xx, the cached DCR client_id is
+        cleared so the subsequent re-auth performs fresh registration."""
+        import anyio
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+
+        async def _setup():
+            await storage.set_client_info(
+                OAuthClientInformationFull(
+                    client_id="stale-dcr-id",
+                    redirect_uris=["http://localhost:19883/callback"],
+                )
+            )
+
+        anyio.run(_setup)
+        assert storage._client_path.exists()
+
+        provider = mcp2cli.build_oauth_provider(
+            "https://example.com/mcp",
+            redirect_uri="http://localhost:19883/callback",
+        )
+
+        # Build a synthetic failed refresh response
+        class _FakeResponse:
+            status_code = 400
+            async def aread(self):
+                return b'{"error":"invalid_grant"}'
+
+        async def _drive():
+            await provider._initialize()
+            provider.context.client_info = await storage.get_client_info()
+            assert provider.context.client_info is not None
+
+            ok = await provider._handle_refresh_response(_FakeResponse())
+            assert ok is False
+            # In-memory and on-disk client_info both cleared
+            assert provider.context.client_info is None
+            assert not storage._client_path.exists()
+
+        anyio.run(_drive)
+
 
 class TestBuildOAuthProvider:
     """Tests for build_oauth_provider factory."""
