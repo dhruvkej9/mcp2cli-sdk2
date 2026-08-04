@@ -1,5 +1,5 @@
 [project]
-name = "mcp2cli"
+name = "mcp2cli-sdk2"
 version = "3.4.0"
 description = "Turn any MCP server or OpenAPI spec into a CLI"
 readme = "README.md"
@@ -23,6 +23,12 @@ Repository = "https://github.com/knowsuchagency/mcp2cli"
 
 [project.scripts]
 mcp2cli = "mcp2cli:main"
+
+[tool.uv.build-backend]
+# Keep the importable module name as `mcp2cli` even though the PyPI
+# distribution is published as `mcp2cli-sdk2`.
+module-name = "mcp2cli"
+module-root = "src"
 
 [build-system]
 requires = ["uv_build>=0.9.5,<0.10.0"]
