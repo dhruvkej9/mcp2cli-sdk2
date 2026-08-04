@@ -2555,19 +2555,7 @@ def run_mcp_http(
 
         headers = dict(auth_headers) if auth_headers else None
 
-        # Auto-detect SSE endpoints from the URL path: if the URL explicitly
-        # points at an SSE endpoint (path ends with /sse), don't try the
-        # Streamable HTTP transport first (it would POST to the SSE URL and
-        # fail with a server error).
-        effective_transport = transport
-        if effective_transport == "auto":
-            try:
-                from urllib.parse import urlparse
-
-                if urlparse(url).path.rstrip("/").endswith("/sse"):
-                    effective_transport = "sse"
-            except Exception:
-                pass
+        effective_transport = _resolve_transport(url, transport)
 
         async def _with_streamable():
             from mcp.client.streamable_http import (
@@ -2629,9 +2617,9 @@ def run_mcp_http(
                 return await _with_streamable()
             except Exception as e:
                 if _is_transport_unsupported(e):
-                    _log_streamable_fallback(e, falling_back=True)
+                    print(f"[mcp2cli] streamable HTTP transport unavailable ({e!r}); falling back to SSE", file=sys.stderr)
                     return await _with_sse()
-                _log_streamable_fallback(e, falling_back=False)
+                print(f"[mcp2cli] streamable HTTP transport failed: {e!r} (not a transport-unsupported condition); not falling back to SSE", file=sys.stderr)
                 raise
 
     anyio.run(_run)
@@ -2828,7 +2816,7 @@ async def _handle_resources(
                 "name": r.name,
                 "uri": str(r.uri),
                 "description": r.description or "",
-                "mimeType": getattr(r, "mime_type", None) or getattr(r, "mimeType", "") or "",
+                "mimeType": r.mime_type or "",
             }
             for r in result.resources
         ]
@@ -2838,11 +2826,11 @@ async def _handle_resources(
         data = [
             {
                 "name": t.name,
-                "uriTemplate": str(getattr(t, "uri_template", None) or getattr(t, "uriTemplate", "")),
+                "uriTemplate": str(t.uri_template),
                 "description": t.description or "",
-                "mimeType": getattr(t, "mime_type", None) or getattr(t, "mimeType", "") or "",
+                "mimeType": t.mime_type or "",
             }
-            for t in getattr(result, "resource_templates", None) or getattr(result, "resourceTemplates", [])
+            for t in result.resource_templates
         ]
         output_result(data, **_out)
     elif action == "read":
@@ -3089,31 +3077,21 @@ def _is_transport_unsupported(exc: BaseException) -> bool:
         return exc.response.status_code in (400, 404, 405, 501)
     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
         return True
-    if isinstance(exc, (ConnectionRefusedError, OSError)):
-        refused = {
-            getattr(socket, "ECONNREFUSED", None),
-            getattr(socket, "EHOSTUNREACH", None),
-            getattr(socket, "ENETUNREACH", None),
-        }
-        if getattr(exc, "errno", None) in refused:
-            return True
     return False
 
 
-def _log_streamable_fallback(exc: BaseException, *, falling_back: bool) -> None:
-    """Log why the streamable HTTP transport was skipped/abandoned."""
-    if falling_back:
-        print(
-            f"[mcp2cli] streamable HTTP transport unavailable ({exc!r}); "
-            "falling back to SSE",
-            file=sys.stderr,
-        )
-    else:
-        print(
-            f"[mcp2cli] streamable HTTP transport failed: {exc!r} "
-            "(not a transport-unsupported condition); not falling back to SSE",
-            file=sys.stderr,
-        )
+def _resolve_transport(url: str, transport: str) -> str:
+    """If auto and the URL points at an SSE endpoint (/sse), use SSE directly
+    instead of POSTing a streamable request to the SSE URL."""
+    if transport == "auto":
+        try:
+            from urllib.parse import urlparse
+
+            if urlparse(url).path.rstrip("/").endswith("/sse"):
+                return "sse"
+        except Exception:
+            pass
+    return transport
 
 
 async def _dispatch_list_tools(session, params):
@@ -3132,7 +3110,7 @@ async def _dispatch_call_tool(session, params):
 async def _dispatch_list_resources(session, params):
     result = await session.list_resources()
     return [
-        {"name": r.name, "uri": str(r.uri), "description": r.description or "", "mimeType": getattr(r, "mime_type", None) or getattr(r, "mimeType", "") or ""}
+        {"name": r.name, "uri": str(r.uri), "description": r.description or "", "mimeType": r.mime_type or ""}
         for r in result.resources
     ]
 
@@ -3145,8 +3123,8 @@ async def _dispatch_read_resource(session, params):
 async def _dispatch_list_resource_templates(session, params):
     result = await session.list_resource_templates()
     return [
-        {"name": t.name, "uriTemplate": str(getattr(t, "uri_template", None) or getattr(t, "uriTemplate", "")), "description": t.description or "", "mimeType": getattr(t, "mime_type", None) or getattr(t, "mimeType", "") or ""}
-        for t in getattr(result, "resource_templates", None) or getattr(result, "resourceTemplates", [])
+        {"name": t.name, "uriTemplate": str(t.uri_template), "description": t.description or "", "mimeType": t.mime_type or ""}
+        for t in result.resource_templates
     ]
 
 
@@ -3630,16 +3608,7 @@ def _fetch_mcp_tools(
 
             headers = dict(auth_headers) if auth_headers else None
 
-            # Auto-detect SSE endpoints from the URL path (see run_mcp_http).
-            effective_transport = transport
-            if effective_transport == "auto":
-                try:
-                    from urllib.parse import urlparse
-
-                    if urlparse(source).path.rstrip("/").endswith("/sse"):
-                        effective_transport = "sse"
-                except Exception:
-                    pass
+            effective_transport = _resolve_transport(source, transport)
 
             async def _via_streamable():
                 from mcp.client.streamable_http import (
@@ -3677,10 +3646,10 @@ def _fetch_mcp_tools(
                     await _via_streamable()
                 except Exception as e:
                     if _is_transport_unsupported(e):
-                        _log_streamable_fallback(e, falling_back=True)
+                        print(f"[mcp2cli] streamable HTTP transport unavailable ({e!r}); falling back to SSE", file=sys.stderr)
                         await _via_sse()
                     else:
-                        _log_streamable_fallback(e, falling_back=False)
+                        print(f"[mcp2cli] streamable HTTP transport failed: {e!r} (not a transport-unsupported condition); not falling back to SSE", file=sys.stderr)
                         raise
 
     anyio.run(_run)
