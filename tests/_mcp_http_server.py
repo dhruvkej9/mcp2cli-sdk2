@@ -1,124 +1,41 @@
+"""Minimal MCP HTTP server for testing (MCP SDK 2.0)."""
 
-"""Minimal MCP HTTP server for testing."""
 import asyncio
-import base64
 import socket
-import sys
 
-from mcp.server import Server
-from mcp.server.lowlevel.helper_types import ReadResourceContents
-from mcp.types import (
-    GetPromptResult,
-    Prompt,
-    PromptArgument,
-    PromptMessage,
-    Resource,
-    ResourceTemplate,
-    TextContent,
-    Tool,
-)
+from mcp.server.mcpserver import MCPServer
 
-app = Server("test-http-server")
+app = MCPServer("test-http-server")
 
 
-@app.list_tools()
-async def list_tools():
-    return [
-        Tool(
-            name="echo",
-            description="Echo back the input",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "message": {"type": "string", "description": "Message to echo"},
-                },
-                "required": ["message"],
-            },
-        ),
-        Tool(
-            name="add_numbers",
-            description="Add two numbers",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "a": {"type": "integer", "description": "First number"},
-                    "b": {"type": "integer", "description": "Second number"},
-                },
-                "required": ["a", "b"],
-            },
-        ),
-    ]
+@app.tool()
+async def echo(message: str) -> str:
+    """Echo back the input."""
+    return message
 
 
-@app.call_tool()
-async def call_tool(name: str, arguments: dict):
-    if name == "echo":
-        return [TextContent(type="text", text=arguments.get("message", ""))]
-    if name == "add_numbers":
-        result = arguments.get("a", 0) + arguments.get("b", 0)
-        return [TextContent(type="text", text=str(result))]
-    return [TextContent(type="text", text=f"Unknown tool: {name}")]
+@app.tool()
+async def add_numbers(a: int, b: int) -> int:
+    """Add two numbers."""
+    return a + b
 
 
-@app.list_resources()
-async def list_resources():
-    return [
-        Resource(
-            uri="file:///test/doc.txt",
-            name="Test Document",
-            description="A test text document",
-            mimeType="text/plain",
-        ),
-    ]
+@app.resource("file:///test/doc.txt", name="Test Document", description="A test text document", mime_type="text/plain")
+async def test_doc() -> str:
+    """A test text document."""
+    return "Hello from test document!"
 
 
-@app.list_resource_templates()
-async def list_resource_templates():
-    return [
-        ResourceTemplate(
-            uriTemplate="file:///test/{name}.txt",
-            name="Text File",
-            description="A text file by name",
-            mimeType="text/plain",
-        ),
-    ]
+@app.resource("file:///test/{name}.txt", name="Test Template", description="A text file by name", mime_type="text/plain")
+async def test_template(name: str) -> str:
+    """A text file by name."""
+    return f"Content of {name}"
 
 
-@app.read_resource()
-async def read_resource(uri):
-    uri_str = str(uri)
-    if uri_str == "file:///test/doc.txt":
-        return [ReadResourceContents(content="Hello from test document!", mime_type="text/plain")]
-    raise ValueError(f"Resource not found: {uri_str}")
-
-
-@app.list_prompts()
-async def list_prompts():
-    return [
-        Prompt(
-            name="greeting",
-            description="Generate a greeting message",
-            arguments=[
-                PromptArgument(name="name", description="Name to greet", required=True),
-                PromptArgument(name="style", description="Greeting style", required=False),
-            ],
-        ),
-    ]
-
-
-@app.get_prompt()
-async def get_prompt(name: str, arguments: dict | None = None):
-    arguments = arguments or {}
-    if name == "greeting":
-        who = arguments.get("name", "World")
-        style = arguments.get("style", "friendly")
-        return GetPromptResult(
-            description=f"A {style} greeting",
-            messages=[
-                PromptMessage(role="user", content=TextContent(type="text", text=f"Please greet {who} in a {style} way.")),
-            ],
-        )
-    raise ValueError(f"Unknown prompt: {name}")
+@app.prompt()
+async def greeting(name: str = "World", style: str = "friendly") -> str:
+    """Generate a greeting message."""
+    return f"Please greet {name} in a {style} way."
 
 
 def find_free_port():
@@ -128,30 +45,9 @@ def find_free_port():
 
 
 async def main():
-    from mcp.server.sse import SseServerTransport
-    from starlette.applications import Starlette
-    from starlette.routing import Mount, Route
-    import uvicorn
-
-    sse = SseServerTransport("/messages/")
-
-    async def handle_sse(request):
-        async with sse.connect_sse(request.scope, request.receive, request._send) as (read, write):
-            await app.run(read, write, app.create_initialization_options())
-
-    starlette_app = Starlette(
-        routes=[
-            Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
-        ],
-    )
-
     port = find_free_port()
     print(f"PORT={port}", flush=True)
-
-    config = uvicorn.Config(starlette_app, host="127.0.0.1", port=port, log_level="error")
-    server = uvicorn.Server(config)
-    await server.serve()
+    await app.run_sse_async(host="127.0.0.1", port=port)
 
 
 if __name__ == "__main__":

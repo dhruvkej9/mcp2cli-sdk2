@@ -784,7 +784,7 @@ def build_oauth_provider(
             storage=storage,
             client_id=client_id,
             client_secret=client_secret,
-            scopes=scope,
+            scope=scope,
         )
 
     from mcp.client.auth.oauth2 import OAuthClientProvider
@@ -2551,12 +2551,32 @@ def run_mcp_http(
 
         headers = dict(auth_headers) if auth_headers else None
 
-        async def _with_streamable():
-            from mcp.client.streamable_http import streamablehttp_client
+        # Auto-detect SSE endpoints from the URL path: if the URL explicitly
+        # points at an SSE endpoint (path ends with /sse), don't try the
+        # Streamable HTTP transport first (it would POST to the SSE URL and
+        # fail with a server error).
+        effective_transport = transport
+        if effective_transport == "auto":
+            try:
+                from urllib.parse import urlparse
 
-            async with streamablehttp_client(
-                url, headers=headers, auth=oauth_provider
-            ) as (read, write, _):
+                if urlparse(url).path.rstrip("/").endswith("/sse"):
+                    effective_transport = "sse"
+            except Exception:
+                pass
+
+        async def _with_streamable():
+            from mcp.client.streamable_http import (
+                create_mcp_http_client,
+                streamable_http_client,
+            )
+
+            http_client = create_mcp_http_client(
+                headers=headers, auth=oauth_provider
+            )
+            async with streamable_http_client(
+                url, http_client=http_client
+            ) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     return await _mcp_session(
@@ -2596,15 +2616,19 @@ def run_mcp_http(
                         **extra,
                     )
 
-        if transport == "sse":
+        if effective_transport == "sse":
             return await _with_sse()
-        elif transport == "streamable":
+        elif effective_transport == "streamable":
             return await _with_streamable()
         else:  # auto
             try:
                 return await _with_streamable()
-            except Exception:
-                return await _with_sse()
+            except Exception as e:
+                if _is_transport_unsupported(e):
+                    _log_streamable_fallback(e, falling_back=True)
+                    return await _with_sse()
+                _log_streamable_fallback(e, falling_back=False)
+                raise
 
     anyio.run(_run)
 
@@ -2734,7 +2758,7 @@ async def _mcp_session(
             {
                 "name": t.name,
                 "description": t.description or "",
-                "inputSchema": t.inputSchema or {},
+                "inputSchema": _tool_schema(t),
             }
             for t in result.tools
         ]
@@ -2767,7 +2791,10 @@ async def _mcp_session(
     if json_output:
         # Emit the full MCP CallToolResult envelope (content, structuredContent,
         # isError) using the SDK's own serializer — 100% MCP-compatible.
-        output_result(result.model_dump(mode="json"), pretty=pretty, head=head, json_output=True)
+        output_result(
+            result.model_dump(mode="json", by_alias=True),
+            pretty=pretty, head=head, json_output=True,
+        )
         return
 
     text = _extract_content_parts(result.content)
@@ -2797,7 +2824,7 @@ async def _handle_resources(
                 "name": r.name,
                 "uri": str(r.uri),
                 "description": r.description or "",
-                "mimeType": r.mimeType or "",
+                "mimeType": getattr(r, "mime_type", None) or getattr(r, "mimeType", "") or "",
             }
             for r in result.resources
         ]
@@ -2807,17 +2834,15 @@ async def _handle_resources(
         data = [
             {
                 "name": t.name,
-                "uriTemplate": str(t.uriTemplate),
+                "uriTemplate": str(getattr(t, "uri_template", None) or getattr(t, "uriTemplate", "")),
                 "description": t.description or "",
-                "mimeType": t.mimeType or "",
+                "mimeType": getattr(t, "mime_type", None) or getattr(t, "mimeType", "") or "",
             }
-            for t in result.resourceTemplates
+            for t in getattr(result, "resource_templates", None) or getattr(result, "resourceTemplates", [])
         ]
         output_result(data, **_out)
     elif action == "read":
-        from pydantic import AnyUrl
-
-        result = await session.read_resource(AnyUrl(uri))
+        result = await session.read_resource(uri)
         parts = []
         for content in result.contents:
             if hasattr(content, "text"):
@@ -3032,10 +3057,65 @@ def _extract_content_parts(content_list, *, attrs=("text", "data")) -> str:
     return "\n".join(parts) if parts else ""
 
 
+def _tool_schema(tool) -> dict:
+    """Return a tool's input schema across MCP SDK versions.
+
+    SDK >= 2.0 renamed ``Tool.inputSchema`` to ``Tool.input_schema``.
+    Older SDKs (and dict-shaped tools) still use ``inputSchema``.
+    """
+    if isinstance(tool, dict):
+        return tool.get("input_schema") or tool.get("inputSchema") or {}
+    schema = getattr(tool, "input_schema", None)
+    if schema is None:
+        schema = getattr(tool, "inputSchema", None)
+    return schema or {}
+
+
+def _is_transport_unsupported(exc: BaseException) -> bool:
+    """Return True if *exc* means the endpoint does not support the requested
+    transport, so falling back to SSE is safe.
+
+    Streamable HTTP is only served by servers that implement it.  Older MCP
+    servers return 405/404 (or refuse the connection) when the endpoint is
+    reached with a streamable request.  Auth failures, timeouts and other
+    errors are *not* transport-unsupported and must be surfaced to the user
+    rather than silently hidden by an SSE fallback.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (400, 404, 405, 501)
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return True
+    if isinstance(exc, (ConnectionRefusedError, OSError)):
+        refused = {
+            getattr(socket, "ECONNREFUSED", None),
+            getattr(socket, "EHOSTUNREACH", None),
+            getattr(socket, "ENETUNREACH", None),
+        }
+        if getattr(exc, "errno", None) in refused:
+            return True
+    return False
+
+
+def _log_streamable_fallback(exc: BaseException, *, falling_back: bool) -> None:
+    """Log why the streamable HTTP transport was skipped/abandoned."""
+    if falling_back:
+        print(
+            f"[mcp2cli] streamable HTTP transport unavailable ({exc!r}); "
+            "falling back to SSE",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[mcp2cli] streamable HTTP transport failed: {exc!r} "
+            "(not a transport-unsupported condition); not falling back to SSE",
+            file=sys.stderr,
+        )
+
+
 async def _dispatch_list_tools(session, params):
     result = await session.list_tools()
     return [
-        {"name": t.name, "description": t.description or "", "inputSchema": t.inputSchema or {}}
+        {"name": t.name, "description": t.description or "", "inputSchema": _tool_schema(t)}
         for t in result.tools
     ]
 
@@ -3048,23 +3128,21 @@ async def _dispatch_call_tool(session, params):
 async def _dispatch_list_resources(session, params):
     result = await session.list_resources()
     return [
-        {"name": r.name, "uri": str(r.uri), "description": r.description or "", "mimeType": r.mimeType or ""}
+        {"name": r.name, "uri": str(r.uri), "description": r.description or "", "mimeType": getattr(r, "mime_type", None) or getattr(r, "mimeType", "") or ""}
         for r in result.resources
     ]
 
 
 async def _dispatch_read_resource(session, params):
-    from pydantic import AnyUrl
-
-    result = await session.read_resource(AnyUrl(params["uri"]))
+    result = await session.read_resource(params["uri"])
     return _extract_content_parts(result.contents, attrs=("text", "blob"))
 
 
 async def _dispatch_list_resource_templates(session, params):
     result = await session.list_resource_templates()
     return [
-        {"name": t.name, "uriTemplate": str(t.uriTemplate), "description": t.description or "", "mimeType": t.mimeType or ""}
-        for t in result.resourceTemplates
+        {"name": t.name, "uriTemplate": str(getattr(t, "uri_template", None) or getattr(t, "uriTemplate", "")), "description": t.description or "", "mimeType": getattr(t, "mime_type", None) or getattr(t, "mimeType", "") or ""}
+        for t in getattr(result, "resource_templates", None) or getattr(result, "resourceTemplates", [])
     ]
 
 
@@ -3241,13 +3319,15 @@ def _run_session_daemon(config_json: str):
             headers = dict(auth_headers) if auth_headers else None
 
             async def _via_streamable():
-                from mcp.client.streamable_http import streamablehttp_client
+                from mcp.client.streamable_http import (
+                    create_mcp_http_client,
+                    streamable_http_client,
+                )
 
-                async with streamablehttp_client(source, headers=headers) as (
-                    read,
-                    write,
-                    _,
-                ):
+                http_client = create_mcp_http_client(headers=headers)
+                async with streamable_http_client(
+                    source, http_client=http_client
+                ) as (read, write):
                     async with ClientSession(read, write) as session:
                         await _run_with_session(session)
 
@@ -3522,7 +3602,7 @@ def _fetch_mcp_tools(
             {
                 "name": t.name,
                 "description": t.description or "",
-                "inputSchema": t.inputSchema or {},
+                "inputSchema": _tool_schema(t),
             }
             for t in result.tools
         )
@@ -3546,12 +3626,29 @@ def _fetch_mcp_tools(
 
             headers = dict(auth_headers) if auth_headers else None
 
-            async def _via_streamable():
-                from mcp.client.streamable_http import streamablehttp_client
+            # Auto-detect SSE endpoints from the URL path (see run_mcp_http).
+            effective_transport = transport
+            if effective_transport == "auto":
+                try:
+                    from urllib.parse import urlparse
 
-                async with streamablehttp_client(
-                    source, headers=headers, auth=oauth_provider
-                ) as (read, write, _):
+                    if urlparse(source).path.rstrip("/").endswith("/sse"):
+                        effective_transport = "sse"
+                except Exception:
+                    pass
+
+            async def _via_streamable():
+                from mcp.client.streamable_http import (
+                    create_mcp_http_client,
+                    streamable_http_client,
+                )
+
+                http_client = create_mcp_http_client(
+                    headers=headers, auth=oauth_provider
+                )
+                async with streamable_http_client(
+                    source, http_client=http_client
+                ) as (read, write):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
                         await _extract_tools(session)
@@ -3567,15 +3664,20 @@ def _fetch_mcp_tools(
                         await session.initialize()
                         await _extract_tools(session)
 
-            if transport == "sse":
+            if effective_transport == "sse":
                 await _via_sse()
-            elif transport == "streamable":
+            elif effective_transport == "streamable":
                 await _via_streamable()
             else:  # auto
                 try:
                     await _via_streamable()
-                except Exception:
-                    await _via_sse()
+                except Exception as e:
+                    if _is_transport_unsupported(e):
+                        _log_streamable_fallback(e, falling_back=True)
+                        await _via_sse()
+                    else:
+                        _log_streamable_fallback(e, falling_back=False)
+                        raise
 
     anyio.run(_run)
     return tools_result

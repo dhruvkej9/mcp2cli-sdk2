@@ -20,6 +20,12 @@ uvx mcp2cli --help
 uv tool install mcp2cli
 ```
 
+> **MCP SDK 2.0 compatible.** mcp2cli 3.4+ is built against the modern
+> [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) 2.0
+> (`Tool.input_schema`, `streamable_http_client` + `create_mcp_http_client`,
+> snake_case resource fields). Streamable HTTP endpoints are auto-detected and
+> SSE URLs (path ending in `/sse`) are selected automatically.
+
 ## AI Agent Skill
 
 mcp2cli ships with an installable [skill](https://skills.sh) that teaches AI coding agents (Claude Code, Cursor, Codex) how to use it. Once installed, your agent can discover and call any MCP server or OpenAPI endpoint — and even generate new skills from APIs.
