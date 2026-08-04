@@ -13,11 +13,15 @@
 ## Install
 
 ```bash
-# Run directly without installing
-uvx mcp2cli --help
+# Run directly without installing (from this fork, SDK 2.0 build)
+uvx --from git+https://github.com/dhruvkej9/mcp2cli.git mcp2cli --help
 
-# Or install globally
-uv tool install mcp2cli
+# Or install globally from this fork
+uv tool install --from git+https://github.com/dhruvkej9/mcp2cli.git mcp2cli
+
+# Once published to PyPI, the plain commands also work:
+#   uvx mcp2cli --help
+#   uv tool install mcp2cli
 ```
 
 > **MCP SDK 2.0 compatible.** mcp2cli 3.4+ is built against the modern
