@@ -1,6 +1,6 @@
 [project]
 name = "mcp2cli"
-version = "3.3.1"
+version = "3.4.0"
 description = "Turn any MCP server or OpenAPI spec into a CLI"
 readme = "README.md"
 license = "MIT"
@@ -10,7 +10,7 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "httpx",
-    "mcp>=1.0",
+    "mcp>=2.0.0",
     "pyyaml",
 ]
 

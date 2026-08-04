@@ -1,186 +1,71 @@
-"""Minimal MCP server for testing — runs over stdio."""
+"""Minimal MCP server for testing — runs over stdio (MCP SDK 2.0)."""
 
 import asyncio
-import sys
+import json
 
-from mcp.server import Server
-from mcp.server.lowlevel.helper_types import ReadResourceContents
-from mcp.server.stdio import stdio_server
-from mcp.types import (
-    GetPromptResult,
-    Prompt,
-    PromptArgument,
-    PromptMessage,
-    Resource,
-    ResourceTemplate,
-    TextContent,
-    Tool,
-)
+from mcp.server.mcpserver import MCPServer
 
-app = Server("test-server")
+app = MCPServer("test-server")
 
 
-@app.list_tools()
-async def list_tools():
-    return [
-        Tool(
-            name="echo",
-            description="Echo back the input",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "message": {"type": "string", "description": "Message to echo"},
-                },
-                "required": ["message"],
-            },
-        ),
-        Tool(
-            name="add_numbers",
-            description="Add two numbers",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "a": {"type": "integer", "description": "First number"},
-                    "b": {"type": "integer", "description": "Second number"},
-                },
-                "required": ["a", "b"],
-            },
-        ),
-        Tool(
-            name="list_items",
-            description="List items in a directory (test tool)",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Directory path"},
-                    "recursive": {"type": "boolean", "description": "Recurse into subdirs"},
-                },
-                "required": ["path"],
-            },
-        ),
-        Tool(
-            name="deploy",
-            description="Deploy to an environment (shadows global --env and --refresh)",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "env": {"type": "string", "description": "Target environment"},
-                    "refresh": {"type": "boolean", "description": "Force refresh"},
-                },
-                "required": ["env"],
-            },
-        ),
-    ]
+@app.tool()
+async def echo(message: str) -> str:
+    """Echo back the input."""
+    return message
 
 
-@app.list_resources()
-async def list_resources():
-    return [
-        Resource(
-            uri="file:///test/doc.txt",
-            name="Test Document",
-            description="A test text document",
-            mimeType="text/plain",
-        ),
-        Resource(
-            uri="file:///test/data.bin",
-            name="Binary Data",
-            description="A test binary resource",
-            mimeType="application/octet-stream",
-        ),
-    ]
+@app.tool()
+async def add_numbers(a: int, b: int) -> int:
+    """Add two numbers."""
+    return a + b
 
 
-@app.list_resource_templates()
-async def list_resource_templates():
-    return [
-        ResourceTemplate(
-            uriTemplate="file:///test/{name}.txt",
-            name="Text File",
-            description="A text file by name",
-            mimeType="text/plain",
-        ),
-    ]
+@app.tool()
+async def list_items(path: str, recursive: bool = False) -> str:
+    """List items in a directory (test tool)."""
+    return json.dumps(
+        {"path": path, "recursive": recursive, "items": ["file1.txt", "file2.txt"]}
+    )
 
 
-@app.read_resource()
-async def read_resource(uri):
-    uri_str = str(uri)
-    if uri_str == "file:///test/doc.txt":
-        return [ReadResourceContents(content="Hello from test document!", mime_type="text/plain")]
-    if uri_str == "file:///test/data.bin":
-        return [ReadResourceContents(content=b"\x00\x01\x02\x03", mime_type="application/octet-stream")]
-    raise ValueError(f"Resource not found: {uri_str}")
+@app.tool()
+async def deploy(env: str, refresh: bool = False) -> str:
+    """Deploy to an environment (shadows global --env and --refresh)."""
+    return json.dumps({"env": env, "refresh": refresh})
 
 
-@app.list_prompts()
-async def list_prompts():
-    return [
-        Prompt(
-            name="greeting",
-            description="Generate a greeting message",
-            arguments=[
-                PromptArgument(name="name", description="Name to greet", required=True),
-                PromptArgument(name="style", description="Greeting style", required=False),
-            ],
-        ),
-        Prompt(
-            name="summary",
-            description="Summarize content",
-            arguments=[
-                PromptArgument(name="topic", description="Topic to summarize", required=True),
-            ],
-        ),
-    ]
+@app.resource("file:///test/doc.txt", name="Test Document", description="A test text document", mime_type="text/plain")
+async def test_doc() -> str:
+    """A test text document."""
+    return "Hello from test document!"
 
 
-@app.get_prompt()
-async def get_prompt(name: str, arguments: dict | None = None):
-    arguments = arguments or {}
-    if name == "greeting":
-        who = arguments.get("name", "World")
-        style = arguments.get("style", "friendly")
-        return GetPromptResult(
-            description=f"A {style} greeting",
-            messages=[
-                PromptMessage(role="user", content=TextContent(type="text", text=f"Please greet {who} in a {style} way.")),
-            ],
-        )
-    if name == "summary":
-        topic = arguments.get("topic", "general")
-        return GetPromptResult(
-            description=f"Summary of {topic}",
-            messages=[
-                PromptMessage(role="user", content=TextContent(type="text", text=f"Please summarize the topic: {topic}")),
-            ],
-        )
-    raise ValueError(f"Unknown prompt: {name}")
+@app.resource("file:///test/data.bin", name="Binary Data", description="A test binary resource", mime_type="application/octet-stream")
+async def test_data() -> bytes:
+    """A binary test resource."""
+    return b"\x00\x01\x02\x03"
 
 
-@app.call_tool()
-async def call_tool(name: str, arguments: dict):
-    if name == "echo":
-        return [TextContent(type="text", text=arguments.get("message", ""))]
-    if name == "add_numbers":
-        result = arguments.get("a", 0) + arguments.get("b", 0)
-        return [TextContent(type="text", text=str(result))]
-    if name == "list_items":
-        path = arguments.get("path", "/")
-        recursive = arguments.get("recursive", False)
-        return [TextContent(type="text", text=f'{{"path": "{path}", "recursive": {str(recursive).lower()}, "items": ["file1.txt", "file2.txt"]}}')]
-    if name == "deploy":
-        import json as _json
+@app.resource("file:///test/{name}.txt", name="Test Template", description="A text file by name", mime_type="text/plain")
+async def test_template(name: str) -> str:
+    """A text file by name."""
+    return f"Content of {name}"
 
-        return [TextContent(type="text", text=_json.dumps({
-            "env": arguments.get("env", ""),
-            "refresh": arguments.get("refresh", False),
-        }))]
-    return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+@app.prompt()
+async def greeting(name: str = "World", style: str = "friendly") -> str:
+    """Generate a greeting message."""
+    return f"Please greet {name} in a {style} way."
+
+
+@app.prompt()
+async def summary(topic: str = "general") -> str:
+    """Summarize content."""
+    return f"Please summarize the topic: {topic}"
 
 
 async def main():
-    async with stdio_server() as (read, write):
-        await app.run(read, write, app.create_initialization_options())
+    await app.run_stdio_async()
 
 
 if __name__ == "__main__":
