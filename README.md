@@ -20,8 +20,8 @@ uvx --from git+https://github.com/dhruvkej9/mcp2cli.git mcp2cli --help
 uv tool install --from git+https://github.com/dhruvkej9/mcp2cli.git mcp2cli
 
 # Once published to PyPI, the plain commands also work:
-#   uvx mcp2cli --help
-#   uv tool install mcp2cli
+#   uvx mcp2cli-sdk2 --help
+#   uv tool install mcp2cli-sdk2
 ```
 
 > **MCP SDK 2.0 compatible.** mcp2cli 3.4+ is built against the modern
