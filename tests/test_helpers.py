@@ -7,7 +7,6 @@ import shutil
 from mcp2cli import (
     ParamDef,
     CommandDef,
-    _apply_head,
     _collect_openapi_params,
     _find_toon_cli,
     _split_at_subcommand,
@@ -200,21 +199,6 @@ class TestOutputResult:
         output_result({"a": 1, "b": 2}, head=1, pretty=True)
         out = json.loads(capsys.readouterr().out)
         assert out == {"a": 1, "b": 2}
-
-class TestApplyHead:
-    def test_list_truncation(self):
-        assert _apply_head([1, 2, 3, 4, 5], 3) == [1, 2, 3]
-
-    def test_dict_passthrough(self):
-        d = {"a": 1}
-        assert _apply_head(d, 2) is d
-
-    def test_empty_list(self):
-        assert _apply_head([], 5) == []
-
-    def test_head_larger_than_list(self):
-        assert _apply_head([1, 2], 10) == [1, 2]
-
 
 class TestToonEncode:
     def test_find_toon_cli_npx(self, monkeypatch):

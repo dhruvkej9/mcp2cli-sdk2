@@ -18,15 +18,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-import tiktoken
-
 from conftest import PETSTORE_SPEC, REALISTIC_MCP_TOOLS
-
-enc = tiktoken.get_encoding("cl100k_base")
 
 
 def _count_tokens(text: str) -> int:
-    return len(enc.encode(text))
+    # ponytail: ~4 chars/token heuristic (drops tiktoken dep). Exact if token
+    # accounting ever matters.
+    return len(text) // 4
 
 
 # ---------------------------------------------------------------------------

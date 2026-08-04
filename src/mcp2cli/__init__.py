@@ -274,21 +274,6 @@ def _toon_encode(json_str: str) -> str | None:
 
 
 
-def _apply_head(data, n: int):
-    """Truncate data to first N elements (array) or return as-is (dict/scalar)."""
-    if isinstance(data, list):
-        return data[:n]
-    return data
-
-
-def _emit_json(data, pretty: bool = False) -> None:
-    """Print *data* as JSON. Indented when *pretty* or stdout is a TTY, else compact."""
-    if pretty or sys.stdout.isatty():
-        print(json.dumps(data, indent=2))
-    else:
-        print(json.dumps(data))
-
-
 def output_result(
     data,
     *,
@@ -309,8 +294,8 @@ def output_result(
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
         if head is not None:
-            data = _apply_head(data, head)
-        _emit_json(data, pretty)
+            data = data[:head] if isinstance(data, list) else data
+        print(json.dumps(data, indent=2) if (pretty or sys.stdout.isatty()) else json.dumps(data))
         return
     if raw:
         if isinstance(data, str):
@@ -325,7 +310,7 @@ def output_result(
             print(data)
             return
     if head is not None:
-        data = _apply_head(data, head)
+        data = data[:head] if isinstance(data, list) else data
     if toon:
         encoded = _toon_encode(json.dumps(data))
         if encoded is not None:
@@ -337,7 +322,7 @@ def output_result(
             file=sys.stderr,
         )
         # Fall through to normal output
-    _emit_json(data, pretty)
+    print(json.dumps(data, indent=2) if (pretty or sys.stdout.isatty()) else json.dumps(data))
 
 
 def _python_type_name(t: type | None) -> str:
@@ -383,7 +368,7 @@ def print_commands_json(
         payload = [cmd.name for cmd in commands]
     else:
         payload = [command_to_dict(cmd) for cmd in commands]
-    _emit_json(payload, pretty)
+    print(json.dumps(payload, indent=2) if (pretty or sys.stdout.isatty()) else json.dumps(payload))
 
 
 def _build_http_headers(auth_headers: list[tuple[str, str]], multipart: bool = False) -> dict[str, str]:
