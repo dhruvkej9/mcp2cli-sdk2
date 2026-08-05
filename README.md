@@ -20,7 +20,7 @@ uvx mcp2cli-sdk2 --help
 uv tool install mcp2cli-sdk2
 
 # Or install from the source fork (SDK 2.0 build)
-uvx --from git+https://github.com/dhruvkej9/mcp2cli.git mcp2cli --help
+uvx --from git+https://github.com/dhruvkej9/mcp2cli-sdk2.git mcp2cli --help
 ```
 
 > **MCP SDK 2.0 compatible.** mcp2cli 3.4+ is built against the modern
