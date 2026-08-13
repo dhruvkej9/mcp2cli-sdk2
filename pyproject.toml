@@ -1,6 +1,6 @@
 [project]
 name = "mcp2cli-sdk2"
-version = "3.4.6"
+version = "3.5.0"
 description = "Turn any MCP server or OpenAPI spec into a CLI"
 readme = "README.md"
 license = "MIT"

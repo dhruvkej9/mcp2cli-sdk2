@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 MCP_SERVER = str(Path(__file__).parent / "mcp_test_server.py")
+SCHEMALESS_SERVER = str(Path(__file__).parent / "cap_style_server.py")
 
 
 class TestMCPStdio:
@@ -219,6 +220,111 @@ class TestMCPStdio:
         assert "World" in data["messages"][0]["content"]
 
 
+class TestMCPSchemalessStdio:
+    """Integration tests against a schema-less (CLI-argv style) stdio server.
+
+    Such servers publish tools with an empty input schema and take arguments
+    as opaque JSON — mcp2cli must route them through --stdin/--json/--arg.
+    """
+
+    def _run(self, *args, stdin_data=None) -> subprocess.CompletedProcess:
+        cmd = [
+            sys.executable,
+            "-m",
+            "mcp2cli",
+            "--mcp-stdio",
+            f"{sys.executable} {SCHEMALESS_SERVER}",
+            "--refresh",
+            *args,
+        ]
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            input=stdin_data,
+            timeout=30,
+        )
+
+    def test_list_tools(self):
+        r = self._run("--list")
+        assert r.returncode == 0
+        assert "run" in r.stdout
+        assert "search-docs" in r.stdout
+
+    def test_call_with_json(self):
+        r = self._run("run", "--json", '{"query": "x"}')
+        assert r.returncode == 0, r.stderr
+        assert 'called run with arguments={"query": "x"}' in r.stdout
+
+    def test_call_with_arg(self):
+        r = self._run("run", "--arg", "query=x")
+        assert r.returncode == 0, r.stderr
+        assert 'called run with arguments={"query": "x"}' in r.stdout
+
+    def test_call_with_arg_repeated(self):
+        r = self._run("run", "--arg", "query=x", "--arg", "limit=5")
+        assert r.returncode == 0, r.stderr
+        assert 'arguments={"limit": "5", "query": "x"}' in r.stdout
+
+    def test_call_with_stdin(self):
+        r = self._run("search-docs", "--stdin", stdin_data='{"q": "sse"}')
+        assert r.returncode == 0, r.stderr
+        assert 'called search_docs with arguments={"q": "sse"}' in r.stdout
+
+    def test_call_without_arguments(self):
+        r = self._run("run")
+        assert r.returncode == 0, r.stderr
+        assert "called run with arguments={}" in r.stdout
+
+    def test_json_and_arg_mutually_exclusive(self):
+        r = self._run("run", "--json", "{}", "--arg", "query=x")
+        assert r.returncode == 1
+        assert "mutually exclusive" in r.stderr
+
+    def test_stdin_and_json_mutually_exclusive(self):
+        r = self._run("run", "--json", "{}", "--stdin", stdin_data="{}")
+        assert r.returncode == 1
+        assert "mutually exclusive" in r.stderr
+
+    def test_invalid_json_rejected(self):
+        r = self._run("run", "--json", "{not json")
+        assert r.returncode == 1
+        assert "invalid json in --json" in r.stderr.lower()
+
+    def test_invalid_arg_pair_rejected(self):
+        r = self._run("run", "--arg", "=novalue")
+        assert r.returncode == 1
+        assert "expected KEY=VALUE" in r.stderr
+
+    def test_help_shows_schemaless_flags(self):
+        r = self._run("run", "--help")
+        assert r.returncode == 0
+        assert "--json" in r.stdout
+        assert "--arg" in r.stdout
+        assert "--stdin" in r.stdout
+
+    def test_is_error_tool_exits_nonzero(self):
+        """Server-side isError results must exit non-zero, no traceback."""
+        r = self._run("boom")
+        assert r.returncode == 1, r.stderr
+        assert "boom exploded" in r.stderr
+        assert "Traceback" not in r.stderr
+
+    def test_is_error_tool_json_envelope(self):
+        r = self._run("--json", "boom")
+        assert r.returncode == 1, r.stderr
+        data = json.loads(r.stdout)
+        assert data.get("isError") is True
+        assert "boom exploded" in json.dumps(data)
+
+    def test_jsonrpc_error_tool_exits_nonzero(self):
+        """JSON-RPC error responses must be surfaced cleanly, no traceback."""
+        r = self._run("mcp-error")
+        assert r.returncode == 1, r.stderr
+        assert "invalid params: nope" in r.stderr
+        assert "Traceback" not in r.stderr
+
+
 class TestMCPHTTP:
     """Tests for MCP HTTP transport.
 
@@ -269,7 +375,7 @@ class TestMCPHTTP:
         proc.terminate()
         proc.wait(timeout=5)
 
-    def _run(self, url, *args) -> subprocess.CompletedProcess:
+    def _run(self, url, *args, stdin_data=None) -> subprocess.CompletedProcess:
         cmd = [
             sys.executable,
             "-m",
@@ -278,7 +384,9 @@ class TestMCPHTTP:
             url,
             *args,
         ]
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return subprocess.run(
+            cmd, capture_output=True, text=True, input=stdin_data, timeout=30
+        )
 
     def test_list_tools_http(self, mcp_http_server):
         r = self._run(mcp_http_server, "--list")
@@ -294,6 +402,17 @@ class TestMCPHTTP:
         r = self._run(mcp_http_server, "add-numbers", "--a", "10", "--b", "20")
         assert r.returncode == 0
         assert "30" in r.stdout
+
+    def test_schemaless_greet_http(self, mcp_http_server):
+        """A tool with no declared parameters is callable over HTTP/SSE."""
+        r = self._run(mcp_http_server, "greet")
+        assert r.returncode == 0, r.stderr
+        assert "hello" in r.stdout
+
+    def test_schemaless_greet_stdin_http(self, mcp_http_server):
+        r = self._run(mcp_http_server, "greet", "--stdin", stdin_data="{}")
+        assert r.returncode == 0, r.stderr
+        assert "hello" in r.stdout
 
     # --- Resources (HTTP) ---
 
@@ -335,6 +454,52 @@ class TestMCPHTTP:
 
 class TestSessions:
     """Tests for persistent session support."""
+
+    def test_session_call_errors(self):
+        """Tool failures over a session surface cleanly (no daemon crash)."""
+        server = f"{sys.executable} {SCHEMALESS_SERVER}"
+        name = "test-call-errors"
+
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "mcp2cli",
+                "--mcp-stdio", server, "--session-start", name,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert r.returncode == 0, r.stderr
+
+        try:
+            r = subprocess.run(
+                [sys.executable, "-m", "mcp2cli", "--session", name, "boom"],
+                capture_output=True, text=True, timeout=10,
+            )
+            assert r.returncode == 1
+            assert "boom exploded" in r.stderr
+            assert "Traceback" not in r.stderr
+
+            r = subprocess.run(
+                [sys.executable, "-m", "mcp2cli", "--session", name, "mcp-error"],
+                capture_output=True, text=True, timeout=10,
+            )
+            assert r.returncode == 1
+            assert "invalid params: nope" in r.stderr
+            assert "Traceback" not in r.stderr
+
+            r = subprocess.run(
+                [
+                    sys.executable, "-m", "mcp2cli",
+                    "--session", name, "run", "--arg", "query=still-alive",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            assert r.returncode == 0, r.stderr
+            assert "called run" in r.stdout
+        finally:
+            subprocess.run(
+                [sys.executable, "-m", "mcp2cli", "--session-stop", name],
+                capture_output=True, text=True, timeout=10,
+            )
 
     def test_session_lifecycle(self):
         """Start, list, and stop a session."""
