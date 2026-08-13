@@ -15,6 +15,7 @@ from mcp2cli import (
     coerce_value,
     extract_mcp_commands,
     extract_openapi_commands,
+    build_argparse,
     load_cached,
     output_result,
     resolve_refs,
@@ -406,6 +407,79 @@ class TestExtractMCPCommands:
         cmds = extract_mcp_commands(tools)
         assert cmds[0].name == "list-items"
         assert cmds[0].tool_name == "list_items"
+
+    def test_none_input_schema(self):
+        """inputSchema: None (CLI-argv style servers) must not crash extraction."""
+        tools = [
+            {
+                "name": "run",
+                "description": "Run a CLI command",
+                "inputSchema": None,
+            }
+        ]
+        cmds = extract_mcp_commands(tools)
+        assert len(cmds) == 1
+        assert cmds[0].name == "run"
+        assert cmds[0].tool_name == "run"
+        assert cmds[0].params == []
+
+    def test_missing_input_schema(self):
+        tools = [{"name": "run", "description": "Run"}]
+        cmds = extract_mcp_commands(tools)
+        assert len(cmds) == 1
+        assert cmds[0].params == []
+
+    def test_schemaless_tool_gets_arg_flags(self):
+        """Schema-less tools expose --stdin/--json/--arg instead of param flags."""
+        pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+        cmds = extract_mcp_commands(
+            [
+                {
+                    "name": "run",
+                    "description": "Run a CLI command",
+                    "inputSchema": None,
+                }
+            ]
+        )
+        parser = build_argparse(cmds, pre)
+        sub = next(
+            a
+            for a in parser._actions  # noqa: SLF001
+            if isinstance(getattr(a, "choices", None), dict) and "run" in a.choices
+        )
+        run = sub.choices["run"]
+        flag_dests = {a.dest for a in run._actions}
+        assert "stdin" in flag_dests
+        assert "json_payload" in flag_dests
+        assert "arg_pairs" in flag_dests
+
+    def test_schemaful_tool_has_no_json_flag(self):
+        """Tools with declared params keep param flags and no --json/--arg."""
+        pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+        cmds = extract_mcp_commands(
+            [
+                {
+                    "name": "echo",
+                    "description": "Echo",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"message": {"type": "string"}},
+                        "required": ["message"],
+                    },
+                }
+            ]
+        )
+        parser = build_argparse(cmds, pre)
+        sub = next(
+            a
+            for a in parser._actions  # noqa: SLF001
+            if isinstance(getattr(a, "choices", None), dict) and "echo" in a.choices
+        )
+        echo = sub.choices["echo"]
+        flag_dests = {a.dest for a in echo._actions}
+        assert "message" in flag_dests
+        assert "json_payload" not in flag_dests
+        assert "arg_pairs" not in flag_dests
 
 
 class TestSplitAtSubcommand:

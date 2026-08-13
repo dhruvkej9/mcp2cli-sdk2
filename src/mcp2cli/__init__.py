@@ -1235,7 +1235,7 @@ def extract_mcp_commands(tools: list[dict]) -> list[CommandDef]:
     for tool in tools:
         name = to_kebab(tool.get("name", "unknown"))
         desc = tool.get("description", "")
-        schema = tool.get("inputSchema", {})
+        schema = tool.get("inputSchema") or {}
         required_fields = set(schema.get("required", []))
         params: list[ParamDef] = []
 
@@ -2185,6 +2185,75 @@ def _run_baked(name: str, argv: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _build_tool_arguments(args, cmd: CommandDef, label: str = "MCP tool arguments") -> dict:
+    """Assemble tool arguments from parsed CLI flags.
+
+    Tools that declare an input schema map each property to its own flag.
+    Tools that declare *no* schema (e.g. CLI-argv servers that publish
+    ``inputSchema: null``) take arguments from ``--stdin`` JSON, a raw
+    ``--json`` object, or repeated ``--arg KEY=VALUE`` pairs.
+    """
+    stdin_given = bool(getattr(args, "stdin", False))
+    json_payload = getattr(args, "json_payload", None)
+    arg_pairs = getattr(args, "arg_pairs", None)
+
+    sources = [
+        name
+        for name, given in (
+            ("--stdin", stdin_given),
+            ("--json", json_payload),
+            ("--arg", arg_pairs),
+        )
+        if given
+    ]
+    if len(sources) > 1:
+        print(
+            f"Error: {' and '.join(sources)} are mutually exclusive.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if stdin_given:
+        return read_stdin_json(label)
+
+    if json_payload:
+        try:
+            parsed = json.loads(json_payload)
+        except json.JSONDecodeError as exc:
+            print(
+                f"Error: invalid JSON in --json "
+                f"(line {exc.lineno}, column {exc.colno}).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not isinstance(parsed, dict):
+            print(
+                "Error: --json must be a JSON object of tool arguments.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return parsed
+
+    arguments = {}
+    for p in cmd.params:
+        val = getattr(args, p.name.replace("-", "_"), None)
+        if val is not None:
+            arguments[p.original_name] = coerce_value(val, p.schema)
+
+    if arg_pairs:
+        for pair in arg_pairs:
+            key, sep, value = pair.partition("=")
+            if not sep or not key.strip():
+                print(
+                    f"Error: invalid --arg (expected KEY=VALUE): {pair!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            arguments[key.strip()] = coerce_value(value, {})
+
+    return arguments
+
+
 def build_argparse(
     commands: list[CommandDef], pre_parser: argparse.ArgumentParser
 ) -> argparse.ArgumentParser:
@@ -2203,12 +2272,29 @@ def build_argparse(
         )
         sub.set_defaults(_cmd=cmd)
 
-        if cmd.has_body:
+        schema_less = cmd.tool_name is not None and not cmd.params
+        if cmd.has_body or schema_less:
             sub.add_argument(
                 "--stdin",
                 action="store_true",
                 default=False,
                 help="Read JSON body/arguments from stdin",
+            )
+        if schema_less:
+            sub.add_argument(
+                "--json",
+                dest="json_payload",
+                default=None,
+                metavar="JSON",
+                help="Tool arguments as a raw JSON object (for tools with no declared input schema)",
+            )
+            sub.add_argument(
+                "--arg",
+                dest="arg_pairs",
+                action="append",
+                default=None,
+                metavar="KEY=VALUE",
+                help="Tool argument as KEY=VALUE; repeatable (for tools with no declared input schema)",
             )
 
         seen_flags: set[str] = set()
@@ -2607,7 +2693,11 @@ def run_mcp_http(
                 print(f"[mcp2cli] streamable HTTP transport failed: {e!r} (not a transport-unsupported condition); not falling back to SSE", file=sys.stderr)
                 raise
 
-    anyio.run(_run)
+    try:
+        anyio.run(_run)
+    except Exception as exc:  # noqa: BLE001 - surface tool failures cleanly
+        _surface_tool_error(exc)
+        raise
 
 
 def run_mcp_stdio(
@@ -2679,7 +2769,56 @@ def run_mcp_stdio(
                     **extra,
                 )
 
-    anyio.run(_run)
+    try:
+        anyio.run(_run)
+    except Exception as exc:  # noqa: BLE001 - surface tool failures cleanly
+        _surface_tool_error(exc)
+        raise
+
+
+def _is_error(result) -> bool:
+    """True when an MCP CallToolResult carries the isError flag.
+
+    The SDK stores the field as ``is_error`` across recent versions while the
+    wire format (and model_dump aliases) use ``isError`` — accept both.
+    """
+    return bool(getattr(result, "isError", getattr(result, "is_error", False)))
+
+
+class _MCPCallError(Exception):
+    """Tool-call failure raised inside SDK context managers.
+
+    The mcp SDK wraps exceptions raised inside its client contexts into
+    ExceptionGroups, so callers detect this type by its ``MCP_TOOL_ERROR|``
+    marker in the flattened message and surface it cleanly at the top level.
+    """
+
+
+_TOOL_ERROR_MARKER = "MCP_TOOL_ERROR|"
+
+
+def _raise_tool_error(message: str) -> None:
+    raise _MCPCallError(f"{_TOOL_ERROR_MARKER}{message}") from None
+
+
+def _surface_tool_error(exc: Exception) -> bool:
+    """Print a marker-carrying error and exit non-zero; False if unrelated."""
+    msg = _exc_message(exc)
+    if _TOOL_ERROR_MARKER not in msg:
+        return False
+    payload = msg.split(_TOOL_ERROR_MARKER, 1)[1]
+    print(f"Error: {payload}", file=sys.stderr)
+    sys.exit(1)
+    return True  # pragma: no cover - sys.exit never returns
+
+
+def _exc_message(exc: BaseException) -> str:
+    """Flatten an exception — incl. SDK ExceptionGroups — into one clean message."""
+    nested = getattr(exc, "exceptions", None)
+    if nested:
+        parts = [_exc_message(e) for e in nested]
+        return "; ".join(p for p in parts if p) or exc.__class__.__name__
+    return str(exc) or exc.__class__.__name__
 
 
 async def _mcp_session(
@@ -2763,7 +2902,17 @@ async def _mcp_session(
         )
         sys.exit(1)
 
-    result = await session.call_tool(tool_name, arguments or {})
+    try:
+        result = await session.call_tool(tool_name, arguments or {})
+    except BaseException as exc:  # JSON-RPC errors surface as SDK exceptions
+        _raise_tool_error(f"tool '{tool_name}' failed: {_exc_message(exc)}")
+
+    if _is_error(result) and json_output:
+        output_result(
+            result.model_dump(mode="json", by_alias=True),
+            pretty=pretty, head=head, json_output=True,
+        )
+        _raise_tool_error(f"tool '{tool_name}' failed (isError)")
 
     if json_output:
         # Emit the full MCP CallToolResult envelope (content, structuredContent,
@@ -2775,6 +2924,8 @@ async def _mcp_session(
         return
 
     text = _extract_content_parts(result.content)
+    if _is_error(result):
+        _raise_tool_error(text)
     output_result(text, pretty=pretty, raw=raw, toon=toon, head=head)
 
 
@@ -3088,7 +3239,12 @@ async def _dispatch_list_tools(session, params):
 
 
 async def _dispatch_call_tool(session, params):
-    result = await session.call_tool(params["name"], params.get("arguments", {}))
+    try:
+        result = await session.call_tool(params["name"], params.get("arguments", {}))
+    except BaseException as exc:
+        return {"__error__": _exc_message(exc)}
+    if _is_error(result):
+        return {"__error__": _extract_content_parts(result.content)}
     return _extract_content_parts(result.content)
 
 
@@ -3534,14 +3690,7 @@ def handle_mcp(
 
     cmd: CommandDef = args._cmd
 
-    if getattr(args, "stdin", False):
-        arguments = read_stdin_json("MCP tool arguments")
-    else:
-        arguments = {}
-        for p in cmd.params:
-            val = getattr(args, p.name.replace("-", "_"), None)
-            if val is not None:
-                arguments[p.original_name] = coerce_value(val, p.schema)
+    arguments = _build_tool_arguments(args, cmd)
 
     _dispatch_mcp_call(
         source, is_stdio, auth_headers, env_vars,
@@ -4135,18 +4284,16 @@ def _handle_session_operations(
         sys.exit(1)
 
     cmd: CommandDef = args._cmd
-    if getattr(args, "stdin", False):
-        arguments = read_stdin_json(f"session {sess_name} tool arguments")
-    else:
-        arguments = {}
-        for p in cmd.params:
-            val = getattr(args, p.name.replace("-", "_"), None)
-            if val is not None:
-                arguments[p.original_name] = coerce_value(val, p.schema)
+    arguments = _build_tool_arguments(
+        args, cmd, label=f"session {sess_name} tool arguments"
+    )
 
     result = _session_request(
         sess_name, "call_tool", {"name": cmd.tool_name, "arguments": arguments}
     )
+    if isinstance(result, dict) and "__error__" in result:
+        print(f"Error: {result['__error__']}", file=sys.stderr)
+        sys.exit(1)
     output_result(result, **_sess_out)
     return True
 

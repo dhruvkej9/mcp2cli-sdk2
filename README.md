@@ -29,6 +29,13 @@ uvx --from git+https://github.com/dhruvkej9/mcp2cli-sdk2.git mcp2cli --help
 > snake_case resource fields). Streamable HTTP endpoints are auto-detected and
 > SSE URLs (path ending in `/sse`) are selected automatically.
 
+> **Robust with any MCP server.** Schema-less tools (servers that publish
+> `inputSchema: null` / no properties, e.g. CLI-argv wrappers) work via
+> `--stdin`, `--json`, or repeatable `--arg KEY=VALUE`. Server-side failures
+> never crash: `isError` results and JSON-RPC error responses are surfaced as
+> `Error: …` on stderr with a non-zero exit code (no tracebacks), across
+> stdio, streamable HTTP, SSE, and persistent sessions.
+
 ## AI Agent Skill
 
 mcp2cli ships with an installable [skill](https://skills.sh) that teaches AI coding agents (Claude Code, Cursor, Codex) how to use it. Once installed, your agent can discover and call any MCP server or OpenAPI endpoint — and even generate new skills from APIs.

@@ -38,6 +38,12 @@ async def greeting(name: str = "World", style: str = "friendly") -> str:
     return f"Please greet {name} in a {style} way."
 
 
+@app.tool()
+async def greet() -> str:
+    """Greet (declares no parameters)."""
+    return "hello"
+
+
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
