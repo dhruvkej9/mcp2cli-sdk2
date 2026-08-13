@@ -453,8 +453,13 @@ class TestExtractMCPCommands:
         assert "json_payload" in flag_dests
         assert "arg_pairs" in flag_dests
 
-    def test_schemaful_tool_has_no_json_flag(self):
-        """Tools with declared params keep param flags and no --json/--arg."""
+    def test_schemaful_tool_keeps_flags_and_the_escape_hatch(self):
+        """Declared params become flags — and --json/--arg stay available.
+
+        The raw escape hatch used to exist only for schema-less tools, which
+        left no way to call a tool whose schema the parser cannot express
+        (deep nesting, a flag that had to be skipped, an under-declared input).
+        """
         pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
         cmds = extract_mcp_commands(
             [
@@ -478,8 +483,9 @@ class TestExtractMCPCommands:
         echo = sub.choices["echo"]
         flag_dests = {a.dest for a in echo._actions}
         assert "message" in flag_dests
-        assert "json_payload" not in flag_dests
-        assert "arg_pairs" not in flag_dests
+        assert "json_payload" in flag_dests
+        assert "arg_pairs" in flag_dests
+        assert "stdin" in flag_dests
 
 
 class TestSplitAtSubcommand:

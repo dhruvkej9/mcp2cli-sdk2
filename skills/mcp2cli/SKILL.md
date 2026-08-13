@@ -59,6 +59,7 @@ Options:
   --auth-header K:V       HTTP header (repeatable, value supports env:/file: prefixes)
   --base-url URL          Override base URL from spec
   --transport TYPE        MCP HTTP transport: auto|sse|streamable (default: auto)
+  --timeout SECONDS       Read timeout for MCP/HTTP requests (default: 300)
   --env KEY=VALUE         Env var for stdio server process (repeatable)
   --session-start NAME   Start a persistent session daemon (requires --mcp or --mcp-stdio)
   --session NAME         Route command through an existing session daemon
@@ -79,8 +80,13 @@ Options:
   --json                  Force valid JSON for every command. --list emits a JSON array;
                           MCP calls emit the full envelope (structuredContent, isError).
   --toon                  Encode output as TOON (token-efficient for LLMs)
-  --head N                Limit output to first N records (arrays)
+  --head N                Limit output to first N records (arrays) or lines (text)
   --version               Show version
+
+Per-tool options (every MCP tool accepts these, in addition to its own flags):
+  --stdin                 Read the tool arguments as JSON from stdin
+  --json JSON             Tool arguments as a raw JSON object (bypasses the flags)
+  --arg KEY=VALUE         Extra tool argument; repeatable
 
 Bake mode:
   bake create NAME [opts]   Save connection settings as a named tool
@@ -270,7 +276,47 @@ Best for large uniform arrays — 40-60% fewer tokens than JSON.
 mcp2cli --spec ./spec.json list-records --head 3 --pretty
 ```
 
-`--head N` slices JSON arrays to the first N elements. Useful for datasets with oversized fields (e.g. geo_shape polygons at ~200KB per record).
+`--head N` slices JSON arrays to the first N elements, and truncates plain-text output to the first N lines. Useful for datasets with oversized fields (e.g. geo_shape polygons at ~200KB per record).
+
+### Calling awkward tools
+
+Generated flags cover most schemas, but not all. Every MCP tool also accepts raw
+arguments, which is the way out for deeply nested inputs or a server that
+under-declares its own schema:
+
+```bash
+# Raw JSON object instead of flags
+mcp2cli --mcp $URL search --json '{"query": "test", "filters": {"lang": "en"}}'
+
+# Individual key=value pairs (repeatable)
+mcp2cli --mcp $URL search --arg query=test --arg limit=10
+
+# From stdin
+echo '{"query": "test"}' | mcp2cli --mcp $URL search --stdin
+```
+
+Booleans take both forms: `--recursive` sends `true`, `--no-recursive` sends
+`false`. Omitting the flag omits the field entirely.
+
+Two tools whose names collide once kebab-cased (`get_user` and `getUser`) appear
+as `get-user` and `get-user-2`.
+
+### Troubleshooting
+
+```bash
+# One-line errors are the default; get the full traceback when diagnosing
+MCP2CLI_DEBUG=1 mcp2cli --mcp $URL --list
+
+# Long-running tool? raise the read timeout (default 300s)
+mcp2cli --mcp $URL --timeout 900 deep-research --topic "..."
+
+# Server only speaks SSE, or only streamable? pin it and skip the probe
+mcp2cli --mcp $URL --transport sse --list
+```
+
+Failures always exit non-zero and print a single `Error: …` line on stderr, so
+stdout stays parseable — `--json` output is safe to pipe into `jq` even when a
+call fails.
 
 ## Security
 

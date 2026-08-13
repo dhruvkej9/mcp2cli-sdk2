@@ -1,6 +1,6 @@
 [project]
 name = "mcp2cli-sdk2"
-version = "3.5.0"
+version = "3.6.0"
 description = "Turn any MCP server or OpenAPI spec into a CLI"
 readme = "README.md"
 license = "MIT"
@@ -9,13 +9,25 @@ authors = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "httpx",
+    # httpx2 (not httpx 0.x): the MCP SDK 2.0 OAuth providers are httpx2.Auth
+    # subclasses and its transports raise httpx2 exceptions, so mcp2cli's own
+    # HTTP layer has to be the same library to interoperate.
+    "httpx2>=2.0",
     "mcp>=2.0.0",
     "pyyaml",
 ]
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "--strict-markers"
+testpaths = ["tests"]
+markers = [
+    "real: hits real third-party MCP servers over the network (opt-in via MCP2CLI_TEST_REAL=1)",
+    "slow: takes more than a few seconds",
+]
 
 [project.urls]
 Homepage = "https://github.com/knowsuchagency/mcp2cli"

@@ -29,12 +29,36 @@ uvx --from git+https://github.com/dhruvkej9/mcp2cli-sdk2.git mcp2cli --help
 > snake_case resource fields). Streamable HTTP endpoints are auto-detected and
 > SSE URLs (path ending in `/sse`) are selected automatically.
 
-> **Robust with any MCP server.** Schema-less tools (servers that publish
-> `inputSchema: null` / no properties, e.g. CLI-argv wrappers) work via
-> `--stdin`, `--json`, or repeatable `--arg KEY=VALUE`. Server-side failures
-> never crash: `isError` results and JSON-RPC error responses are surfaced as
-> `Error: …` on stderr with a non-zero exit code (no tracebacks), across
-> stdio, streamable HTTP, SSE, and persistent sessions.
+> **Robust with any MCP server.** mcp2cli is built to survive what real servers
+> actually send, not just what the spec says they should:
+>
+> - **Paginated lists** — `tools/list`, `resources/list`, `prompts/list` and
+>   templates are followed through every `nextCursor` page, so tools past the
+>   first page are visible *and* callable.
+> - **Awkward names** — two tools that kebab-case to the same CLI name
+>   (`get_user` / `getUser`) become `get-user` and `get-user-2`; names with
+>   slashes, dots or spaces are made typable. The original name still goes on
+>   the wire.
+> - **Awkward schemas** — union types (`["integer", "null"]`, `anyOf`), enums
+>   with no declared `type`, and properties named `help`/`stdin`/`json` (which
+>   argparse owns, and which used to break the whole CLI) all work. Booleans
+>   get `--flag` *and* `--no-flag`.
+> - **Out-of-spec payloads** — a single tool with `inputSchema: null` or `{}`
+>   makes the MCP SDK reject the entire tool list. mcp2cli falls back to an
+>   unvalidated read and keeps every usable tool, rather than losing the server.
+> - **Every content block** — text, images/audio, `resource_link` URIs and
+>   embedded resources are all rendered; results carrying only
+>   `structuredContent` print their structured payload.
+> - **Escape hatch on every tool** — `--stdin`, `--json '{...}'` or repeatable
+>   `--arg KEY=VALUE` bypass the generated flags for any tool.
+> - **Clean failures** — `isError` results, JSON-RPC errors, unreachable hosts
+>   and servers that die at startup all surface as one `Error: …` line on
+>   stderr with a non-zero exit code, never a traceback (set `MCP2CLI_DEBUG=1`
+>   to get the traceback back), across stdio, streamable HTTP, SSE and
+>   persistent sessions.
+> - **Transport auto-detection** — `auto` prefers streamable HTTP and retries
+>   over SSE when the endpoint genuinely does not implement it; an auth failure
+>   is reported instead of being hidden behind a pointless retry.
 
 ## AI Agent Skill
 
@@ -318,6 +342,7 @@ Options:
   --auth-header K:V       HTTP header (repeatable, value supports env:/file: prefixes)
   --base-url URL          Override base URL from spec
   --transport TYPE        MCP HTTP transport: auto|sse|streamable (default: auto)
+  --timeout SECONDS       Read timeout for MCP requests and HTTP calls (default: 300)
   --env KEY=VALUE         Env var for MCP stdio server (repeatable)
   --oauth                 Enable OAuth (authorization code + PKCE flow)
   --oauth-client-id ID    OAuth client ID (supports env:/file: prefixes)
@@ -356,18 +381,52 @@ Subcommands and their flags are generated dynamically from the spec or MCP serve
 
 > For token savings analysis, architecture details, and comparison to Anthropic's Tool Search, see the **[full writeup on the OCAI blog](https://www.orangecountyai.com/blog/mcp2cli-one-cli-for-every-api-zero-wasted-tokens)**.
 
+### Debugging
+
+```bash
+# Full traceback instead of the one-line error
+MCP2CLI_DEBUG=1 mcp2cli --mcp https://mcp.example.com/mcp --list
+
+# Raise the timeout for a long-running tool
+mcp2cli --mcp https://mcp.example.com/mcp --timeout 900 deep-research --topic "..."
+
+# Call any tool with raw JSON, bypassing the generated flags
+mcp2cli --mcp https://mcp.example.com/mcp search --json '{"query": "test", "filters": {"lang": "en"}}'
+```
+
 ## Development
 
 ```bash
 # Install with test + MCP deps
 uv sync --extra test
 
-# Run tests (96 tests covering OpenAPI, MCP stdio, MCP HTTP, caching, and token savings)
-uv run pytest tests/ -v
+# Run the hermetic suite (no network) — OpenAPI, GraphQL, MCP stdio/HTTP,
+# caching, token savings, plus the robustness and transport suites
+uv run pytest tests/
+
+# Run the robustness suite alone (hostile-but-legal MCP server fixture)
+uv run pytest tests/test_robustness.py tests/test_transport_fallback.py -v
+
+# Opt in to integration tests against real published MCP servers
+# (needs Node.js + network: everything / filesystem / memory servers,
+#  over stdio, streamable HTTP and SSE, plus a real MCP 1.x server)
+MCP2CLI_TEST_REAL=1 uv run pytest tests/test_real_servers.py -v
 
 # Run just the token savings tests
 uv run pytest tests/test_token_savings.py -v -s
 ```
+
+### How the test suite is organised
+
+| File | What it proves |
+| --- | --- |
+| `tests/test_mcp.py`, `test_openapi.py`, `test_graphql.py` | the happy paths per mode |
+| `tests/hostile_server.py` | a raw JSON-RPC server that emits every legal-but-awkward shape |
+| `tests/test_robustness.py` | pagination, name collisions, reserved flag names, odd enums/unions, content blocks, out-of-spec payloads, clean error surfaces |
+| `tests/test_transport_fallback.py` | streamable ⇄ SSE selection, and that auth failures never trigger a retry |
+| `tests/test_sessions.py` | the persistent session daemon behaves identically to a direct connection |
+| `tests/test_real_servers.py` | the same behaviour against real published servers (opt-in) |
+| `tests/test_cache.py`, `test_bake.py`, `test_usage.py`, `test_oauth.py` | caching, baked configs, usage ranking, OAuth wiring |
 
 ---
 

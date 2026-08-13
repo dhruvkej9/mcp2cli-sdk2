@@ -24,6 +24,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -35,12 +36,26 @@ from urllib.parse import parse_qs, urlparse
 from datetime import datetime, timezone
 
 import anyio
-import httpx
+
+# The MCP SDK 2.0 is built on httpx2 (not httpx 0.x): its OAuth providers are
+# ``httpx2.Auth`` subclasses and its transports raise ``httpx2`` exceptions.
+# Using plain httpx here made OAuth unusable in --spec/--graphql mode
+# (``TypeError: Invalid "auth" argument``) and made every ``isinstance`` check
+# against transport errors silently false.  Share the SDK's client library.
+import httpx2 as httpx
 
 CACHE_DIR = Path(
     os.environ.get("MCP2CLI_CACHE_DIR", Path.home() / ".cache" / "mcp2cli")
 )
 DEFAULT_CACHE_TTL = 3600
+# Read timeout for MCP sessions and HTTP calls. Long-running tools (deep
+# research, builds, migrations) routinely outlive a 30s default.
+DEFAULT_TIMEOUT = 300.0
+# ponytail: process-wide timeout instead of threading a parameter through ~30
+# call sites; one CLI invocation has exactly one timeout. Make it a parameter
+# if mcp2cli ever runs more than one source per process.
+_TIMEOUT = DEFAULT_TIMEOUT
+MAX_PAGES = 1000
 USAGE_FILE = CACHE_DIR / "usage.json"
 CONFIG_DIR = Path(
     os.environ.get("MCP2CLI_CONFIG_DIR", Path.home() / ".config" / "mcp2cli")
@@ -169,8 +184,62 @@ def read_stdin_json(context: str):
         sys.exit(1)
 
 
-def schema_type_to_python(schema: dict) -> tuple[type | None, str]:
+_JSON_TYPES = ("boolean", "integer", "number", "string", "array", "object")
+
+
+def _enum_type(enum_values: list) -> str | None:
+    """Infer a JSON Schema type from enum members (servers often omit ``type``).
+
+    Without this, ``{"enum": [1, 2, 3]}`` produced a string flag whose argparse
+    ``choices`` were ints, so ``--level 2`` failed with "invalid choice: '2'".
+    """
+    kinds = {type(v) for v in enum_values if v is not None}
+    if not kinds:
+        return None
+    if kinds <= {bool}:
+        return "boolean"
+    if kinds <= {int}:
+        return "integer"
+    if kinds <= {int, float}:
+        return "number"
+    if kinds <= {str}:
+        return "string"
+    return None  # mixed types — treat as free-form
+
+
+def effective_schema_type(schema: dict) -> str | None:
+    """Resolve a property's JSON Schema type across the shapes servers emit.
+
+    Handles the plain ``{"type": "integer"}`` case plus the three shapes that
+    previously degraded to an untyped string flag (so ``--count 5`` sent
+    ``"5"``, which strict pydantic/zod servers reject):
+
+    * union type lists — ``{"type": ["integer", "null"]}``
+    * ``anyOf`` / ``oneOf`` — ``{"anyOf": [{"type": "boolean"}, {...null}]}``
+    * bare enums with no ``type`` at all
+    """
+    if not isinstance(schema, dict):
+        return None
     t = schema.get("type")
+    if isinstance(t, str):
+        return t if t in _JSON_TYPES else None
+    if isinstance(t, list):
+        for candidate in t:
+            if candidate in _JSON_TYPES and candidate != "null":
+                return candidate
+        return None
+    for key in ("anyOf", "oneOf", "allOf"):
+        for sub in schema.get(key) or []:
+            resolved = effective_schema_type(sub) if isinstance(sub, dict) else None
+            if resolved:
+                return resolved
+    if isinstance(schema.get("enum"), list):
+        return _enum_type(schema["enum"])
+    return None
+
+
+def schema_type_to_python(schema: dict) -> tuple[type | None, str]:
+    t = effective_schema_type(schema)
     if t == "integer":
         return int, ""
     if t == "number":
@@ -198,7 +267,7 @@ def _coerce_item(value: str, item_type: str | None):
 def coerce_value(value, schema: dict):
     if value is None:
         return None
-    t = schema.get("type")
+    t = effective_schema_type(schema)
     if t == "array":
         if isinstance(value, list):
             return value
@@ -209,7 +278,8 @@ def coerce_value(value, schema: dict):
                     return parsed
             except (json.JSONDecodeError, TypeError):
                 pass
-            item_type = schema.get("items", {}).get("type")
+            items = schema.get("items")
+            item_type = effective_schema_type(items) if isinstance(items, dict) else None
             if "," in value:
                 return [_coerce_item(v.strip(), item_type) for v in value.split(",")]
             return [_coerce_item(value, item_type)]
@@ -220,11 +290,21 @@ def coerce_value(value, schema: dict):
         except (json.JSONDecodeError, TypeError):
             return value
     if t == "boolean":
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1", "yes", "on")
         return bool(value)
+    # A value that cannot be coerced is passed through untouched: the server's
+    # own validation gives a better error than a Python traceback would.
     if t == "integer":
-        return int(value)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
     if t == "number":
-        return float(value)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return value
     # Schema-less fallback: try to parse JSON objects/arrays from strings
     if t is None and isinstance(value, str):
         stripped = value.strip()
@@ -241,6 +321,69 @@ def coerce_value(value, schema: dict):
 def to_kebab(name: str) -> str:
     s = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", name)
     return s.replace("_", "-").lower()
+
+
+_UNSAFE_NAME_CHARS = re.compile(r"[^a-z0-9.-]+")
+
+
+def to_cli_name(name: str) -> str:
+    """Kebab-case a server-side name into something typable as a CLI word.
+
+    Real servers publish names like ``browser/navigate``, ``Slack.postMessage``
+    and ``search files``. The wire name is kept on the CommandDef, so mangling
+    the display name here is free.
+    """
+    cli = _UNSAFE_NAME_CHARS.sub("-", to_kebab(name or ""))
+    cli = re.sub(r"-{2,}", "-", cli).strip("-")
+    return cli or "tool"
+
+
+# Flags argparse (or mcp2cli itself) already owns on a tool subparser. A tool
+# property with one of these names used to raise
+# ``argparse.ArgumentError: conflicting option string: --help`` while the parser
+# was being built — which killed *every* command on that server, not just the
+# offending tool.
+RESERVED_FLAGS = frozenset({"help", "h", "stdin", "json", "arg"})
+
+
+def safe_flag_name(name: str, taken: set[str] | None = None) -> str:
+    """Return a CLI flag name that collides with nothing argparse already owns.
+
+    Renames the flags argparse/mcp2cli reserve (``--help``, ``--stdin``, …) and
+    disambiguates two properties that kebab to the same flag (``fooBar`` and
+    ``foo_bar``), which would otherwise silently drop the second one.
+    """
+    name = _UNSAFE_NAME_CHARS.sub("-", name).strip("-") or "arg"
+    if name in RESERVED_FLAGS:
+        name = f"arg-{name}"
+    if taken is None:
+        return name
+    candidate, n = name, 1
+    while candidate in taken:
+        n += 1
+        candidate = f"{name}-{n}"
+    taken.add(candidate)
+    return candidate
+
+
+def dedupe_command_names(commands: list["CommandDef"]) -> list["CommandDef"]:
+    """Make CLI command names unique, preserving the original wire names.
+
+    Distinct tools can kebab-case to the same CLI name (``get_user`` and
+    ``getUser`` → ``get-user``). argparse rejects a duplicate subparser with
+    ``ValueError: conflicting subparser``, which previously made every command
+    on such a server — including ``--help`` — unusable. Later duplicates get a
+    numeric suffix instead.
+    """
+    seen: dict[str, int] = {}
+    for cmd in commands:
+        if cmd.name in seen:
+            seen[cmd.name] += 1
+            cmd.name = f"{cmd.name}-{seen[cmd.name]}"
+            seen.setdefault(cmd.name, 1)
+        else:
+            seen[cmd.name] = 1
+    return commands
 
 
 def _find_toon_cli() -> str | None:
@@ -274,6 +417,13 @@ def _toon_encode(json_str: str) -> str | None:
 
 
 
+def _head_text(text: str, head: int | None) -> str:
+    """Truncate plain text to the first *head* lines."""
+    if head is None:
+        return text
+    return "\n".join(text.splitlines()[:head])
+
+
 def output_result(
     data,
     *,
@@ -299,7 +449,7 @@ def output_result(
         return
     if raw:
         if isinstance(data, str):
-            print(data)
+            print(_head_text(data, head))
         else:
             print(json.dumps(data))
         return
@@ -307,7 +457,8 @@ def output_result(
         try:
             data = json.loads(data)
         except (json.JSONDecodeError, TypeError):
-            print(data)
+            # Plain prose: --head truncates lines (as documented).
+            print(_head_text(data, head))
             return
     if head is not None:
         data = data[:head] if isinstance(data, list) else data
@@ -1079,7 +1230,7 @@ def load_openapi_spec(
                 return cached
 
         headers = dict(auth_headers)
-        with httpx.Client(timeout=30, auth=oauth_provider) as client:
+        with httpx.Client(timeout=_http_timeout(), auth=oauth_provider) as client:
             resp = client.get(source, headers=headers)
             resp.raise_for_status()
             raw = resp.text
@@ -1150,7 +1301,7 @@ def extract_openapi_commands(spec: dict) -> list[CommandDef]:
                 schema = param.get("schema", {})
                 py_type, suffix = schema_type_to_python(schema)
                 p = ParamDef(
-                    name=to_kebab(param["name"]),
+                    name=safe_flag_name(to_kebab(param["name"])),
                     original_name=param["name"],
                     python_type=py_type,
                     required=param.get("required", False),
@@ -1199,7 +1350,7 @@ def extract_openapi_commands(spec: dict) -> list[CommandDef]:
                     py_type, suffix = schema_type_to_python(prop_schema)
                     loc = "body"
                 p = ParamDef(
-                    name=to_kebab(prop_name),
+                    name=safe_flag_name(to_kebab(prop_name)),
                     original_name=prop_name,
                     python_type=py_type,
                     required=prop_name in required_fields,
@@ -1222,7 +1373,7 @@ def extract_openapi_commands(spec: dict) -> list[CommandDef]:
                 )
             )
 
-    return commands
+    return dedupe_command_names(commands)
 
 
 # ---------------------------------------------------------------------------
@@ -1233,17 +1384,23 @@ def extract_openapi_commands(spec: dict) -> list[CommandDef]:
 def extract_mcp_commands(tools: list[dict]) -> list[CommandDef]:
     commands: list[CommandDef] = []
     for tool in tools:
-        name = to_kebab(tool.get("name", "unknown"))
+        name = to_cli_name(tool.get("name", "unknown"))
         desc = tool.get("description", "")
-        schema = tool.get("inputSchema") or {}
-        required_fields = set(schema.get("required", []))
+        schema = _tool_schema(tool)
+        required_fields = set(schema.get("required") or [])
         params: list[ParamDef] = []
+        taken_flags: set[str] = set()
 
-        for prop_name, prop_schema in schema.get("properties", {}).items():
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            properties = {}
+        for prop_name, prop_schema in properties.items():
+            if not isinstance(prop_schema, dict):
+                prop_schema = {}
             py_type, suffix = schema_type_to_python(prop_schema)
             params.append(
                 ParamDef(
-                    name=to_kebab(prop_name),
+                    name=safe_flag_name(to_kebab(prop_name), taken_flags),
                     original_name=prop_name,
                     python_type=py_type,
                     required=prop_name in required_fields,
@@ -1263,7 +1420,7 @@ def extract_mcp_commands(tools: list[dict]) -> list[CommandDef]:
                 tool_name=tool.get("name"),
             )
         )
-    return commands
+    return dedupe_command_names(commands)
 
 
 # ---------------------------------------------------------------------------
@@ -1467,7 +1624,7 @@ def load_graphql_schema(
 
     headers = dict(auth_headers)
     headers.setdefault("Content-Type", "application/json")
-    with httpx.Client(timeout=30, auth=oauth_provider) as client:
+    with httpx.Client(timeout=_http_timeout(), auth=oauth_provider) as client:
         resp = client.post(
             url,
             headers=headers,
@@ -1533,7 +1690,7 @@ def _build_graphql_param(arg: dict, types_by_name: dict) -> ParamDef:
         arg_desc += " (JSON object)"
 
     return ParamDef(
-        name=to_kebab(arg["name"]),
+        name=safe_flag_name(to_kebab(arg["name"])),
         original_name=arg["name"],
         python_type=py_type,
         required=required,
@@ -1593,7 +1750,7 @@ def extract_graphql_commands(schema: dict) -> list[CommandDef]:
                 )
             )
 
-    return commands
+    return dedupe_command_names(commands)
 
 
 def _truncate_description(description: str, max_len: int) -> str:
@@ -1732,7 +1889,7 @@ def execute_graphql(
 
     headers = _build_http_headers(auth_headers)
 
-    with httpx.Client(timeout=60, auth=oauth_provider) as client:
+    with httpx.Client(timeout=_http_timeout(), auth=oauth_provider) as client:
         resp = client.post(
             url,
             headers=headers,
@@ -1811,7 +1968,7 @@ def handle_graphql(
     execute_graphql(
         args, cmd, url, schema, auth_headers, pretty, raw, toon=toon,
         fields_override=fields_override, oauth_provider=oauth_provider,
-        json_output=json_output,
+        head=head, json_output=json_output,
     )
 
     # Record usage after successful execution
@@ -2272,21 +2429,25 @@ def build_argparse(
         )
         sub.set_defaults(_cmd=cmd)
 
-        schema_less = cmd.tool_name is not None and not cmd.params
-        if cmd.has_body or schema_less:
+        is_mcp_tool = cmd.tool_name is not None
+        if cmd.has_body or is_mcp_tool:
             sub.add_argument(
                 "--stdin",
                 action="store_true",
                 default=False,
                 help="Read JSON body/arguments from stdin",
             )
-        if schema_less:
+        if is_mcp_tool:
+            # Every MCP tool gets the raw escape hatch, not just schema-less
+            # ones: it is the way out when a schema cannot be expressed as
+            # flags (deep nesting, a property the parser had to skip, a server
+            # that under-declares its own inputs).
             sub.add_argument(
                 "--json",
                 dest="json_payload",
                 default=None,
                 metavar="JSON",
-                help="Tool arguments as a raw JSON object (for tools with no declared input schema)",
+                help="Tool arguments as a raw JSON object (bypasses the generated flags)",
             )
             sub.add_argument(
                 "--arg",
@@ -2294,7 +2455,7 @@ def build_argparse(
                 action="append",
                 default=None,
                 metavar="KEY=VALUE",
-                help="Tool argument as KEY=VALUE; repeatable (for tools with no declared input schema)",
+                help="Extra tool argument as KEY=VALUE; repeatable",
             )
 
         seen_flags: set[str] = set()
@@ -2307,7 +2468,9 @@ def build_argparse(
             if p.python_type is not None:
                 kwargs["type"] = p.python_type
             else:
-                kwargs["action"] = "store_true"
+                # BooleanOptionalAction gives --flag / --no-flag, so `false` is
+                # expressible. store_true could only ever send `true`.
+                kwargs["action"] = argparse.BooleanOptionalAction
             # Body/tool_input params are never argparse-required (--stdin bypasses them)
             if (
                 p.required
@@ -2318,11 +2481,46 @@ def build_argparse(
             else:
                 kwargs.setdefault("default", None)
             kwargs["help"] = escape_argparse_help(p.description)
-            if p.choices:
-                kwargs["choices"] = p.choices
-            sub.add_argument(flag, **kwargs)
+            choices = _argparse_choices(p)
+            if choices:
+                kwargs["choices"] = choices
+            try:
+                sub.add_argument(flag, **kwargs)
+            except (argparse.ArgumentError, ValueError, TypeError) as exc:
+                # A single unrepresentable parameter must not take down the
+                # whole CLI: skip the flag and keep --stdin/--json usable.
+                seen_flags.discard(flag)
+                print(
+                    f"[mcp2cli] skipping flag {flag} of '{cmd.name}' ({exc}); "
+                    "pass it via --stdin JSON instead",
+                    file=sys.stderr,
+                )
 
     return parser
+
+
+def _argparse_choices(p: "ParamDef") -> list | None:
+    """Coerce enum members to the flag's own type.
+
+    argparse compares the parsed value against ``choices`` *after* applying
+    ``type``, so an int enum with a string flag (or vice versa) rejects every
+    value the server would accept.
+    """
+    if not p.choices:
+        return None
+    target = p.python_type
+    if target is None:  # boolean flag — choices are meaningless
+        return None
+    coerced = []
+    for choice in p.choices:
+        if isinstance(choice, target):
+            coerced.append(choice)
+            continue
+        try:
+            coerced.append(target(choice))
+        except (TypeError, ValueError):
+            return None  # can't represent this enum — accept any value
+    return coerced
 
 
 # ---------------------------------------------------------------------------
@@ -2519,7 +2717,7 @@ def execute_openapi(
     headers.update(extra_headers)
 
     try:
-        with httpx.Client(timeout=60, auth=oauth_provider) as client:
+        with httpx.Client(timeout=_http_timeout(), auth=oauth_provider) as client:
             if files is not None:
                 resp = client.request(
                     (cmd.method or "get").upper(),
@@ -2573,6 +2771,156 @@ def execute_openapi(
 
 
 # ---------------------------------------------------------------------------
+# MCP: connection
+# ---------------------------------------------------------------------------
+
+
+async def _connect_stdio(command_str: str, env_vars: dict[str, str], work):
+    """Open a stdio MCP session and hand it to *work*."""
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    parts = shlex.split(command_str)
+    if not parts:
+        print("Error: --mcp-stdio command is empty", file=sys.stderr)
+        sys.exit(1)
+    env = {**os.environ, **env_vars}
+    params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
+    async with stdio_client(params) as (read, write):
+        async with _client_session(read, write) as session:
+            return await work(session)
+
+
+async def _connect_http(
+    url: str,
+    auth_headers: list[tuple[str, str]],
+    transport: str,
+    oauth_provider,
+    work,
+):
+    """Open an HTTP MCP session (streamable or SSE) and hand it to *work*.
+
+    ``auto`` prefers streamable HTTP and falls back to SSE only when the
+    endpoint genuinely does not implement it (405/404/-32601/refused). Auth
+    failures and timeouts propagate instead of triggering a pointless retry.
+    """
+    headers = dict(auth_headers) if auth_headers else None
+    effective_transport = _resolve_transport(url, transport)
+
+    async def _with_streamable():
+        from mcp.client.streamable_http import streamable_http_client
+
+        http_client = _create_mcp_http_client(headers, auth=oauth_provider)
+        async with streamable_http_client(url, http_client=http_client) as (read, write):
+            async with _client_session(read, write) as session:
+                return await work(session)
+
+    async def _with_sse():
+        from mcp.client.sse import sse_client
+
+        async with sse_client(
+            url,
+            headers=headers,
+            auth=oauth_provider,
+            sse_read_timeout=_TIMEOUT,
+        ) as (read, write):
+            async with _client_session(read, write) as session:
+                return await work(session)
+
+    if effective_transport == "sse":
+        return await _with_sse()
+    if effective_transport == "streamable":
+        return await _with_streamable()
+    try:
+        return await _with_streamable()
+    except BaseException as exc:  # noqa: BLE001 - decide, then re-raise
+        if _surface_tool_error_present(exc):
+            raise
+        if not await _should_retry_over_sse(url, headers, oauth_provider, exc):
+            raise
+        print(
+            f"[mcp2cli] streamable HTTP unavailable ({_exc_message(exc)}); "
+            "retrying over SSE",
+            file=sys.stderr,
+        )
+        try:
+            return await _with_sse()
+        except BaseException as sse_exc:  # noqa: BLE001
+            if _surface_tool_error_present(sse_exc):
+                raise
+            # Both transports failed. The streamable error describes the
+            # endpoint the user actually asked for, so report that one.
+            raise exc from sse_exc
+
+
+_AUTH_STATUS = (401, 403, 407)
+
+
+def _is_auth_failure(exc: BaseException) -> bool:
+    """True when the endpoint rejected our credentials."""
+    for e in _iter_exceptions(exc):
+        if isinstance(e, httpx.HTTPStatusError):
+            if e.response.status_code in _AUTH_STATUS:
+                return True
+    return False
+
+
+async def _probe_http_status(url: str, headers, auth) -> int | None:
+    """Ask the endpoint what it thinks of an MCP POST, and report the status.
+
+    The SDK collapses 400/401/403/405/500 into one opaque
+    ``MCPError(-32603, "Server returned an error response")``, so the status
+    code — the only thing that distinguishes "no streamable support here, try
+    SSE" from "your token is bad" — has to be recovered directly. Only ever
+    runs on the failure path of ``--transport auto``; ``initialize`` is a
+    side-effect-free request.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "mcp2cli", "version": __version__},
+        },
+    }
+    probe_headers = dict(headers or {})
+    probe_headers.setdefault("Accept", "application/json, text/event-stream")
+    probe_headers.setdefault("Content-Type", "application/json")
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, read=10.0), auth=auth, follow_redirects=True
+        ) as client:
+            response = await client.post(url, headers=probe_headers, json=payload)
+            return response.status_code
+    except Exception:
+        return None
+
+
+async def _should_retry_over_sse(url: str, headers, auth, exc: BaseException) -> bool:
+    """Decide whether a failed streamable attempt deserves an SSE retry."""
+    if _is_auth_failure(exc):
+        return False
+    status = await _probe_http_status(url, headers, auth)
+    if status in _AUTH_STATUS:
+        return False
+    if status is None:
+        # The endpoint could not be probed at all; fall back only on the
+        # exception shapes that are unambiguous on their own.
+        return _is_transport_unsupported(exc)
+    return True
+
+
+def _surface_tool_error_present(exc: BaseException) -> bool:
+    """True when *exc* is a tool-level failure, not a transport problem.
+
+    A tool that fails after a successful handshake must never trigger a
+    transport fallback — the second attempt would run the tool twice.
+    """
+    return _TOOL_ERROR_MARKER in _exc_message(exc)
+
+
+# ---------------------------------------------------------------------------
 # MCP: execution
 # ---------------------------------------------------------------------------
 
@@ -2622,82 +2970,27 @@ def run_mcp_http(
     )
 
     async def _run():
-        from mcp import ClientSession
-
-        headers = dict(auth_headers) if auth_headers else None
-
-        effective_transport = _resolve_transport(url, transport)
-
-        async def _with_streamable():
-            from mcp.client.streamable_http import streamable_http_client
-            try:
-                from mcp.client.streamable_http import create_mcp_http_client
-            except ImportError:  # mcp>=2.1 moved it to _httpx_utils
-                from mcp.shared._httpx_utils import create_mcp_http_client
-            http_client = create_mcp_http_client(
-                headers=headers, auth=oauth_provider
+        async def _work(session):
+            await session.initialize()
+            return await _mcp_session(
+                session,
+                tool_name,
+                arguments,
+                list_mode,
+                pretty,
+                raw,
+                cache_key,
+                ttl,
+                refresh,
+                toon=toon,
+                **extra,
             )
-            async with streamable_http_client(
-                url, http_client=http_client
-            ) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    return await _mcp_session(
-                        session,
-                        tool_name,
-                        arguments,
-                        list_mode,
-                        pretty,
-                        raw,
-                        cache_key,
-                        ttl,
-                        refresh,
-                        toon=toon,
-                        **extra,
-                    )
 
-        async def _with_sse():
-            from mcp.client.sse import sse_client
+        return await _connect_http(
+            url, auth_headers, transport, oauth_provider, _work
+        )
 
-            async with sse_client(url, headers=headers, auth=oauth_provider) as (
-                read,
-                write,
-            ):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    return await _mcp_session(
-                        session,
-                        tool_name,
-                        arguments,
-                        list_mode,
-                        pretty,
-                        raw,
-                        cache_key,
-                        ttl,
-                        refresh,
-                        toon=toon,
-                        **extra,
-                    )
-
-        if effective_transport == "sse":
-            return await _with_sse()
-        elif effective_transport == "streamable":
-            return await _with_streamable()
-        else:  # auto
-            try:
-                return await _with_streamable()
-            except Exception as e:
-                if _is_transport_unsupported(e):
-                    print(f"[mcp2cli] streamable HTTP transport unavailable ({e!r}); falling back to SSE", file=sys.stderr)
-                    return await _with_sse()
-                print(f"[mcp2cli] streamable HTTP transport failed: {e!r} (not a transport-unsupported condition); not falling back to SSE", file=sys.stderr)
-                raise
-
-    try:
-        anyio.run(_run)
-    except Exception as exc:  # noqa: BLE001 - surface tool failures cleanly
-        _surface_tool_error(exc)
-        raise
+    run_mcp_async(_run, source=url, is_stdio=False)
 
 
 def run_mcp_stdio(
@@ -2742,47 +3035,39 @@ def run_mcp_stdio(
         json_output=json_output,
     )
 
-    import anyio
-
     async def _run():
-        from mcp import ClientSession
-        from mcp.client.stdio import StdioServerParameters, stdio_client
+        async def _work(session):
+            await session.initialize()
+            await _mcp_session(
+                session,
+                tool_name,
+                arguments,
+                list_mode,
+                pretty,
+                raw,
+                cache_key,
+                ttl,
+                refresh,
+                toon=toon,
+                **extra,
+            )
 
-        parts = shlex.split(command_str)
-        env = {**os.environ, **env_vars}
-        params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
+        await _connect_stdio(command_str, env_vars, _work)
 
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                await _mcp_session(
-                    session,
-                    tool_name,
-                    arguments,
-                    list_mode,
-                    pretty,
-                    raw,
-                    cache_key,
-                    ttl,
-                    refresh,
-                    toon=toon,
-                    **extra,
-                )
-
-    try:
-        anyio.run(_run)
-    except Exception as exc:  # noqa: BLE001 - surface tool failures cleanly
-        _surface_tool_error(exc)
-        raise
+    run_mcp_async(_run, source=command_str, is_stdio=True)
 
 
 def _is_error(result) -> bool:
     """True when an MCP CallToolResult carries the isError flag.
 
     The SDK stores the field as ``is_error`` across recent versions while the
-    wire format (and model_dump aliases) use ``isError`` — accept both.
+    wire format (and model_dump aliases) use ``isError`` — accept both, on
+    models and on raw dicts.
     """
-    return bool(getattr(result, "isError", getattr(result, "is_error", False)))
+    flag = _field(result, "isError")
+    if flag is None:
+        flag = _field(result, "is_error")
+    return bool(flag)
 
 
 class _MCPCallError(Exception):
@@ -2819,6 +3104,57 @@ def _exc_message(exc: BaseException) -> str:
         parts = [_exc_message(e) for e in nested]
         return "; ".join(p for p in parts if p) or exc.__class__.__name__
     return str(exc) or exc.__class__.__name__
+
+
+def _tool_call_hint(message: str) -> str:
+    """Append actionable advice to opaque server-side failures."""
+    if "task augmentation" in message or "taskSupport" in message:
+        return (
+            f"{message}\n"
+            "  This tool requires MCP task augmentation (protocol 2025-11-25), "
+            "which the installed mcp SDK does not expose to clients yet."
+        )
+    return message
+
+
+def _connection_hint(source: str, is_stdio: bool, message: str) -> str:
+    """Turn an opaque transport failure into something a user can act on."""
+    lowered = message.lower()
+    if is_stdio and ("connection closed" in lowered or "broken" in lowered):
+        return (
+            f"MCP server '{source}' closed the connection before the handshake "
+            f"completed ({message}). Check the server's own stderr above, and "
+            "that the command starts standalone."
+        )
+    if not is_stdio and ("connect" in lowered or "connection" in lowered):
+        return f"cannot reach MCP server at {source}: {message}"
+    return message
+
+
+def run_mcp_async(fn, source: str = "", is_stdio: bool = False) -> None:
+    """Run an MCP coroutine, reporting failures as one clean error line.
+
+    Every MCP failure used to reach the terminal as a multi-level anyio
+    ``ExceptionGroup`` traceback — a bad URL, an unknown resource, a server that
+    exits at startup. Set ``MCP2CLI_DEBUG=1`` to get the traceback back.
+    """
+    try:
+        anyio.run(fn)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:  # pragma: no cover - interactive only
+        print("Interrupted.", file=sys.stderr)
+        sys.exit(130)
+    except BaseException as exc:  # noqa: BLE001 - surface every failure cleanly
+        _surface_tool_error(exc)
+        if os.environ.get("MCP2CLI_DEBUG"):
+            raise
+        print(
+            "Error: "
+            + _tool_call_hint(_connection_hint(source, is_stdio, _exc_message(exc))),
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 async def _mcp_session(
@@ -2869,15 +3205,7 @@ async def _mcp_session(
     )
 
     if list_mode:
-        result = await session.list_tools()
-        tools = [
-            {
-                "name": t.name,
-                "description": t.description or "",
-                "inputSchema": _tool_schema(t),
-            }
-            for t in result.tools
-        ]
+        tools = await _fetch_tool_dicts(session)
         commands = extract_mcp_commands(tools)
         if search_pattern:
             commands = _filter_commands(commands, search_pattern)
@@ -2903,9 +3231,11 @@ async def _mcp_session(
         sys.exit(1)
 
     try:
-        result = await session.call_tool(tool_name, arguments or {})
+        result = await _call_tool_robust(session, tool_name, arguments)
     except BaseException as exc:  # JSON-RPC errors surface as SDK exceptions
-        _raise_tool_error(f"tool '{tool_name}' failed: {_exc_message(exc)}")
+        _raise_tool_error(
+            f"tool '{tool_name}' failed: {_tool_call_hint(_exc_message(exc))}"
+        )
 
     if _is_error(result) and json_output:
         output_result(
@@ -2923,9 +3253,9 @@ async def _mcp_session(
         )
         return
 
-    text = _extract_content_parts(result.content)
+    text = render_tool_result(result)
     if _is_error(result):
-        _raise_tool_error(text)
+        _raise_tool_error(text or f"tool '{tool_name}' reported an error")
     output_result(text, pretty=pretty, raw=raw, toon=toon, head=head)
 
 
@@ -2946,39 +3276,11 @@ async def _handle_resources(
 ):
     _out = dict(pretty=pretty, raw=raw, toon=toon, head=head, json_output=json_output)
     if action == "list":
-        result = await session.list_resources()
-        data = [
-            {
-                "name": r.name,
-                "uri": str(r.uri),
-                "description": r.description or "",
-                "mimeType": r.mime_type or "",
-            }
-            for r in result.resources
-        ]
-        output_result(data, **_out)
+        output_result(await _fetch_resource_dicts(session), **_out)
     elif action == "templates":
-        result = await session.list_resource_templates()
-        data = [
-            {
-                "name": t.name,
-                "uriTemplate": str(t.uri_template),
-                "description": t.description or "",
-                "mimeType": t.mime_type or "",
-            }
-            for t in result.resource_templates
-        ]
-        output_result(data, **_out)
+        output_result(await _fetch_template_dicts(session), **_out)
     elif action == "read":
-        result = await session.read_resource(uri)
-        parts = []
-        for content in result.contents:
-            if hasattr(content, "text"):
-                parts.append(content.text)
-            elif hasattr(content, "blob"):
-                parts.append(content.blob)
-        text = "\n".join(parts) if parts else ""
-        output_result(text, **_out)
+        output_result(await _read_resource_robust(session, uri), **_out)
 
 
 # ---------------------------------------------------------------------------
@@ -2999,36 +3301,9 @@ async def _handle_prompts(
 ):
     _out = dict(pretty=pretty, raw=raw, toon=toon, head=head, json_output=json_output)
     if action == "list":
-        result = await session.list_prompts()
-        data = [
-            {
-                "name": p.name,
-                "description": p.description or "",
-                "arguments": [
-                    {
-                        "name": a.name,
-                        "description": a.description or "",
-                        "required": a.required or False,
-                    }
-                    for a in (p.arguments or [])
-                ],
-            }
-            for p in result.prompts
-        ]
-        output_result(data, **_out)
+        output_result(await _fetch_prompt_dicts(session), **_out)
     elif action == "get":
-        result = await session.get_prompt(name, arguments or {})
-        messages = []
-        for msg in result.messages:
-            content = msg.content
-            if hasattr(content, "text"):
-                messages.append({"role": msg.role, "content": content.text})
-            else:
-                messages.append(
-                    {"role": msg.role, "content": json.dumps(content.model_dump())}
-                )
-        data = {"description": result.description or "", "messages": messages}
-        output_result(data, **_out)
+        output_result(await _get_prompt_robust(session, name, arguments), **_out)
 
 
 # ---------------------------------------------------------------------------
@@ -3042,8 +3317,20 @@ def _session_meta_path(name: str) -> Path:
     return SESSIONS_DIR / f"{name}.json"
 
 
+# AF_UNIX socket paths are capped by the kernel (~104 bytes incl. NUL). A deep
+# MCP2CLI_CACHE_DIR or home directory blows that budget, and the daemon dies
+# with an opaque "AF_UNIX path too long".
+_AF_UNIX_MAX = 100
+
+
 def _session_sock_path(name: str) -> Path:
-    return SESSIONS_DIR / f"{name}.sock"
+    path = SESSIONS_DIR / f"{name}.sock"
+    if len(str(path).encode()) <= _AF_UNIX_MAX:
+        return path
+    # Deterministic short fallback, so the daemon and its clients agree on the
+    # path without having to exchange it.
+    digest = hashlib.sha256(str(path).encode()).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / f"mcp2cli-{digest}.sock"
 
 def _session_log_path(name: str) -> Path:
     return SESSIONS_DIR / f"{name}.log"
@@ -3174,15 +3461,80 @@ def session_start(
     sys.exit(1)
 
 
-def _extract_content_parts(content_list, *, attrs=("text", "data")) -> str:
-    """Extract text/data/blob from MCP content objects, joined by newline."""
-    parts = []
-    for c in content_list:
-        for attr in attrs:
-            if hasattr(c, attr):
-                parts.append(getattr(c, attr))
-                break
-    return "\n".join(parts) if parts else ""
+def _field(block, name: str):
+    """Read *name* off a content block, whether it is a model or raw JSON."""
+    if isinstance(block, dict):
+        return block.get(name)
+    return getattr(block, name, None)
+
+
+def _render_block(block) -> str | None:
+    """Render one MCP content block as text, or None when it carries nothing.
+
+    Covers every block kind in the spec, not just ``text``:
+
+    * ``text`` → the text
+    * ``image`` / ``audio`` → the base64 payload
+    * ``resource_link`` → the URI (previously dropped silently, so tools like
+      the everything server's ``get-resource-links`` printed only a preamble)
+    * ``resource`` (embedded) → the embedded text, else its base64 blob
+
+    Accepts both SDK models and raw dicts, so it works on the lenient path too.
+    """
+    if block is None:
+        return None
+    if isinstance(block, str):
+        return block
+    text = _field(block, "text")
+    if text is not None:
+        return text
+    resource = _field(block, "resource")
+    if resource is not None:
+        for key in ("text", "blob"):
+            value = _field(resource, key)
+            if value is not None:
+                return value
+        uri = _field(resource, "uri")
+        return str(uri) if uri is not None else None
+    for key in ("data", "blob"):
+        value = _field(block, key)
+        if value is not None:
+            return value
+    uri = _field(block, "uri")  # resource_link
+    if uri is not None:
+        name = _field(block, "name")
+        return f"{name}: {uri}" if name else str(uri)
+    return None
+
+
+def _extract_content_parts(content_list) -> str:
+    """Render MCP content blocks to text, joined by newline."""
+    parts = [_render_block(c) for c in content_list or []]
+    return "\n".join(p for p in parts if p is not None)
+
+
+def _structured_content(result):
+    """Return a result's structuredContent across SDK naming conventions."""
+    value = _field(result, "structured_content")
+    if value is None:
+        value = _field(result, "structuredContent")
+    return value
+
+
+def render_tool_result(result) -> str:
+    """Human-readable text for a CallToolResult.
+
+    Falls back to ``structuredContent`` when there are no renderable content
+    blocks: tools that declare an ``outputSchema`` are allowed to return
+    ``content: []``, and those previously printed nothing at all.
+    """
+    text = _extract_content_parts(getattr(result, "content", None) or [])
+    if text:
+        return text
+    structured = _structured_content(result)
+    if structured is not None:
+        return json.dumps(structured)
+    return ""
 
 
 def _tool_schema(tool) -> dict:
@@ -3199,21 +3551,366 @@ def _tool_schema(tool) -> dict:
     return schema or {}
 
 
+def _iter_exceptions(exc: BaseException):
+    """Yield *exc* and every exception nested inside it.
+
+    The MCP SDK runs its transports in anyio task groups, so a plain 404 from
+    the server arrives as ``ExceptionGroup(ExceptionGroup(MCPError(...)))``.
+    Anything that inspects an exception's type has to look inside the group —
+    the old ``isinstance`` checks against the outer object were always false.
+    """
+    yield exc
+    for nested in getattr(exc, "exceptions", None) or ():
+        yield from _iter_exceptions(nested)
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None and cause is not exc:
+        yield cause
+
+
+# JSON-RPC / HTTP conditions that mean "this endpoint does not speak streamable
+# HTTP", so retrying over SSE is safe. 405 and 404 are what pre-streamable
+# servers answer with; -32601 (method not found) is what an SSE-only MCP server
+# answers when a streamable POST reaches it.
+_UNSUPPORTED_STATUS = (400, 404, 405, 406, 501)
+_METHOD_NOT_FOUND = -32601
+
+
 def _is_transport_unsupported(exc: BaseException) -> bool:
     """Return True if *exc* means the endpoint does not support the requested
     transport, so falling back to SSE is safe.
 
-    Streamable HTTP is only served by servers that implement it.  Older MCP
-    servers return 405/404 (or refuse the connection) when the endpoint is
-    reached with a streamable request.  Auth failures, timeouts and other
-    errors are *not* transport-unsupported and must be surfaced to the user
-    rather than silently hidden by an SSE fallback.
+    Auth failures (401/403), timeouts and TLS errors are *not*
+    transport-unsupported: they must surface to the user rather than being
+    hidden behind a second failed connection attempt.
     """
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in (400, 404, 405, 501)
-    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
-        return True
+    for e in _iter_exceptions(exc):
+        if isinstance(e, httpx.HTTPStatusError):
+            if e.response.status_code in _UNSUPPORTED_STATUS:
+                return True
+            continue
+        if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout)):
+            return True
+        code = getattr(e, "code", None)
+        if code == _METHOD_NOT_FOUND:
+            return True
+        # Some SDK/transport errors only carry a message.
+        text = str(e)
+        if any(marker in text for marker in ("405", "Method Not Allowed", "Not Found")):
+            return True
     return False
+
+
+def _mcp_client_info():
+    """Identify mcp2cli to the server (servers log and gate on clientInfo)."""
+    try:
+        from mcp import types
+
+        return types.Implementation(name="mcp2cli", version=__version__)
+    except Exception:  # pragma: no cover - never block a call over identity
+        return None
+
+
+def _client_session(read, write):
+    """Build a ClientSession with mcp2cli's identity and timeout."""
+    from mcp import ClientSession
+
+    return ClientSession(
+        read,
+        write,
+        read_timeout_seconds=_TIMEOUT,
+        client_info=_mcp_client_info(),
+    )
+
+
+def _http_timeout():
+    """httpx timeout matching --timeout, with a shorter connect budget."""
+    return httpx.Timeout(min(30.0, _TIMEOUT), read=_TIMEOUT)
+
+
+def _create_mcp_http_client(headers, auth=None):
+    """create_mcp_http_client across mcp 2.0/2.1 module layouts."""
+    try:
+        from mcp.client.streamable_http import create_mcp_http_client
+    except ImportError:  # mcp>=2.1 moved it to _httpx_utils
+        from mcp.shared._httpx_utils import create_mcp_http_client
+    return create_mcp_http_client(headers=headers, timeout=_http_timeout(), auth=auth)
+
+
+async def _paginate(list_fn, items_attr: str) -> list:
+    """Collect every page of a paginated MCP list request.
+
+    The spec pages ``tools/list``, ``resources/list``,
+    ``resources/templates/list`` and ``prompts/list`` with an opaque
+    ``nextCursor``. Reading only the first page — as mcp2cli used to — makes
+    every tool past the page boundary invisible *and* uncallable on the large
+    servers and gateways that actually paginate.
+    """
+    from mcp import types
+
+    items: list = []
+    cursor = None
+    for _ in range(MAX_PAGES):
+        if cursor is None:
+            result = await list_fn()
+        else:
+            try:
+                result = await list_fn(params=types.PaginatedRequestParams(cursor=cursor))
+            except TypeError:  # older SDKs took the cursor positionally
+                result = await list_fn(cursor)
+        page = list(getattr(result, items_attr, None) or [])
+        items.extend(page)
+        next_cursor = getattr(result, "next_cursor", None) or getattr(
+            result, "nextCursor", None
+        )
+        # Stop on no cursor, a repeated cursor, or an empty page: a buggy server
+        # must not spin us forever.
+        if not next_cursor or next_cursor == cursor or not page:
+            break
+        cursor = next_cursor
+    return items
+
+
+def _tools_as_dicts(tools: list) -> list[dict]:
+    return [
+        {
+            "name": t.name,
+            "description": t.description or "",
+            "inputSchema": _tool_schema(t),
+        }
+        for t in tools
+    ]
+
+
+def _has_validation_error(exc: BaseException) -> bool:
+    """True when a failure is the SDK rejecting the server's payload shape."""
+    try:
+        from pydantic import ValidationError
+    except ImportError:  # pragma: no cover - pydantic ships with mcp
+        return False
+    return any(isinstance(e, ValidationError) for e in _iter_exceptions(exc))
+
+
+# --- lenient (unvalidated) fallback layer ----------------------------------
+#
+# The SDK validates every server response against the schema for the *method*
+# (``_methods.validate_server_result``), so a single out-of-spec field makes the
+# whole response unusable — one tool with ``inputSchema: null`` takes down a
+# 200-tool server, one odd content block loses an otherwise fine tool result.
+# Real servers ship exactly these payloads. When strict parsing fails we retry
+# through the dispatcher, which hands back the raw JSON-RPC result, and salvage
+# what is usable. mcp2cli is a CLI, not a conformance suite: printing the
+# server's answer beats refusing to speak to it.
+
+
+async def _raw_request(session, method: str, params: dict | None = None) -> dict:
+    """Send one JSON-RPC request and return its unvalidated result dict."""
+    dispatcher = getattr(session, "_dispatcher", None)
+    send_raw = getattr(dispatcher, "send_raw_request", None)
+    if send_raw is None:  # pragma: no cover - guards a future SDK refactor
+        raise RuntimeError("this mcp SDK build exposes no raw request API")
+    opts: dict = {}
+    if _TIMEOUT:
+        opts["timeout"] = _TIMEOUT
+    return await send_raw(method, params, opts)
+
+
+async def _paginate_raw(session, method: str, items_key: str) -> list:
+    """Follow ``nextCursor`` through a paginated method, unvalidated."""
+    items: list = []
+    cursor = None
+    for _ in range(MAX_PAGES):
+        params = {"cursor": cursor} if cursor else None
+        raw = await _raw_request(session, method, params)
+        page = raw.get(items_key) or []
+        items.extend(item for item in page if isinstance(item, dict))
+        next_cursor = raw.get("nextCursor")
+        if not next_cursor or next_cursor == cursor or not page:
+            break
+        cursor = next_cursor
+    return items
+
+
+def _warn_lenient(what: str, exc: BaseException) -> None:
+    detail = _exc_message(exc).splitlines()[0]
+    print(
+        f"[mcp2cli] server's {what} does not match the MCP schema ({detail}); "
+        "falling back to a lenient read",
+        file=sys.stderr,
+    )
+
+
+async def _strict_or_lenient(what: str, strict, lenient):
+    """Run *strict*; on a schema-validation failure, run *lenient* instead."""
+    try:
+        return await strict()
+    except BaseException as exc:  # noqa: BLE001 - decide, then re-raise
+        if not _has_validation_error(exc):
+            raise
+        _warn_lenient(what, exc)
+        return await lenient()
+
+
+def _normalize_raw_tool(tool: dict) -> dict | None:
+    if not tool.get("name"):
+        return None
+    schema = tool.get("inputSchema")
+    if schema is None:
+        schema = tool.get("input_schema")
+    return {
+        "name": tool["name"],
+        "description": tool.get("description") or "",
+        "inputSchema": schema if isinstance(schema, dict) else {},
+    }
+
+
+async def _fetch_tool_dicts(session) -> list[dict]:
+    """Every tool, across every page, tolerating out-of-spec entries."""
+
+    async def strict():
+        return _tools_as_dicts(await _paginate(session.list_tools, "tools"))
+
+    async def lenient():
+        raw_tools = await _paginate_raw(session, "tools/list", "tools")
+        return [t for t in map(_normalize_raw_tool, raw_tools) if t]
+
+    return await _strict_or_lenient("tool list", strict, lenient)
+
+
+async def _fetch_resource_dicts(session) -> list[dict]:
+    async def strict():
+        return _resources_as_dicts(await _paginate(session.list_resources, "resources"))
+
+    async def lenient():
+        return [
+            {
+                "name": r.get("name") or str(r.get("uri", "")),
+                "uri": str(r.get("uri", "")),
+                "description": r.get("description") or "",
+                "mimeType": r.get("mimeType") or r.get("mime_type") or "",
+            }
+            for r in await _paginate_raw(session, "resources/list", "resources")
+        ]
+
+    return await _strict_or_lenient("resource list", strict, lenient)
+
+
+async def _fetch_template_dicts(session) -> list[dict]:
+    async def strict():
+        return _templates_as_dicts(
+            await _paginate(session.list_resource_templates, "resource_templates")
+        )
+
+    async def lenient():
+        return [
+            {
+                "name": t.get("name") or "",
+                "uriTemplate": str(t.get("uriTemplate") or t.get("uri_template") or ""),
+                "description": t.get("description") or "",
+                "mimeType": t.get("mimeType") or t.get("mime_type") or "",
+            }
+            for t in await _paginate_raw(
+                session, "resources/templates/list", "resourceTemplates"
+            )
+        ]
+
+    return await _strict_or_lenient("resource template list", strict, lenient)
+
+
+async def _fetch_prompt_dicts(session) -> list[dict]:
+    async def strict():
+        return _prompts_as_dicts(await _paginate(session.list_prompts, "prompts"))
+
+    async def lenient():
+        prompts = []
+        for p in await _paginate_raw(session, "prompts/list", "prompts"):
+            args = p.get("arguments")
+            prompts.append(
+                {
+                    "name": p.get("name") or "",
+                    "description": p.get("description") or "",
+                    "arguments": [
+                        {
+                            "name": a.get("name") or "",
+                            "description": a.get("description") or "",
+                            "required": bool(a.get("required")),
+                        }
+                        for a in (args or [])
+                        if isinstance(a, dict)
+                    ],
+                }
+            )
+        return prompts
+
+    return await _strict_or_lenient("prompt list", strict, lenient)
+
+
+class _RawToolResult:
+    """CallToolResult stand-in built from an unvalidated JSON-RPC result."""
+
+    def __init__(self, raw: dict):
+        self.raw = raw if isinstance(raw, dict) else {}
+        self.content = self.raw.get("content") or []
+        self.structured_content = self.raw.get("structuredContent")
+        self.isError = bool(self.raw.get("isError"))
+
+    def model_dump(self, *args, **kwargs) -> dict:
+        return self.raw
+
+
+async def _call_tool_robust(session, tool_name: str, arguments: dict | None):
+    """Call a tool, surviving a result the MCP schema rejects."""
+
+    async def strict():
+        return await session.call_tool(tool_name, arguments or {})
+
+    async def lenient():
+        return _RawToolResult(
+            await _raw_request(
+                session,
+                "tools/call",
+                {"name": tool_name, "arguments": arguments or {}},
+            )
+        )
+
+    return await _strict_or_lenient(f"result for '{tool_name}'", strict, lenient)
+
+
+async def _read_resource_robust(session, uri: str) -> str:
+    async def strict():
+        result = await session.read_resource(uri)
+        return _extract_content_parts(result.contents)
+
+    async def lenient():
+        raw = await _raw_request(session, "resources/read", {"uri": uri})
+        return _extract_content_parts(raw.get("contents") or [])
+
+    return await _strict_or_lenient(f"resource {uri}", strict, lenient)
+
+
+async def _get_prompt_robust(session, name: str, arguments: dict | None) -> dict:
+    async def strict():
+        return _prompt_messages(await session.get_prompt(name, arguments or {}))
+
+    async def lenient():
+        raw = await _raw_request(
+            session, "prompts/get", {"name": name, "arguments": arguments or {}}
+        )
+        messages = []
+        for msg in raw.get("messages") or []:
+            if not isinstance(msg, dict):
+                continue
+            rendered = _render_block(msg.get("content"))
+            messages.append(
+                {
+                    "role": msg.get("role", "user"),
+                    "content": rendered
+                    if rendered is not None
+                    else json.dumps(msg.get("content")),
+                }
+            )
+        return {"description": raw.get("description") or "", "messages": messages}
+
+    return await _strict_or_lenient(f"prompt '{name}'", strict, lenient)
 
 
 def _resolve_transport(url: str, transport: str) -> str:
@@ -3230,70 +3927,90 @@ def _resolve_transport(url: str, transport: str) -> str:
     return transport
 
 
-async def _dispatch_list_tools(session, params):
-    result = await session.list_tools()
+def _resources_as_dicts(resources: list) -> list[dict]:
     return [
-        {"name": t.name, "description": t.description or "", "inputSchema": _tool_schema(t)}
-        for t in result.tools
+        {
+            "name": r.name,
+            "uri": str(r.uri),
+            "description": r.description or "",
+            "mimeType": r.mime_type or "",
+        }
+        for r in resources
     ]
 
 
-async def _dispatch_call_tool(session, params):
-    try:
-        result = await session.call_tool(params["name"], params.get("arguments", {}))
-    except BaseException as exc:
-        return {"__error__": _exc_message(exc)}
-    if _is_error(result):
-        return {"__error__": _extract_content_parts(result.content)}
-    return _extract_content_parts(result.content)
-
-
-async def _dispatch_list_resources(session, params):
-    result = await session.list_resources()
+def _templates_as_dicts(templates: list) -> list[dict]:
     return [
-        {"name": r.name, "uri": str(r.uri), "description": r.description or "", "mimeType": r.mime_type or ""}
-        for r in result.resources
+        {
+            "name": t.name,
+            "uriTemplate": str(t.uri_template),
+            "description": t.description or "",
+            "mimeType": t.mime_type or "",
+        }
+        for t in templates
     ]
 
 
-async def _dispatch_read_resource(session, params):
-    result = await session.read_resource(params["uri"])
-    return _extract_content_parts(result.contents, attrs=("text", "blob"))
-
-
-async def _dispatch_list_resource_templates(session, params):
-    result = await session.list_resource_templates()
-    return [
-        {"name": t.name, "uriTemplate": str(t.uri_template), "description": t.description or "", "mimeType": t.mime_type or ""}
-        for t in result.resource_templates
-    ]
-
-
-async def _dispatch_list_prompts(session, params):
-    result = await session.list_prompts()
+def _prompts_as_dicts(prompts: list) -> list[dict]:
     return [
         {
             "name": p.name,
             "description": p.description or "",
             "arguments": [
-                {"name": a.name, "description": a.description or "", "required": a.required or False}
+                {
+                    "name": a.name,
+                    "description": a.description or "",
+                    "required": a.required or False,
+                }
                 for a in (p.arguments or [])
             ],
         }
-        for p in result.prompts
+        for p in prompts
     ]
 
 
-async def _dispatch_get_prompt(session, params):
-    result = await session.get_prompt(params["name"], params.get("arguments", {}))
+def _prompt_messages(result) -> dict:
     messages = []
     for msg in result.messages:
-        content = msg.content
-        if hasattr(content, "text"):
-            messages.append({"role": msg.role, "content": content.text})
-        else:
-            messages.append({"role": msg.role, "content": json.dumps(content.model_dump())})
+        rendered = _render_block(msg.content)
+        if rendered is None:
+            rendered = json.dumps(msg.content.model_dump(mode="json", by_alias=True))
+        messages.append({"role": msg.role, "content": rendered})
     return {"description": result.description or "", "messages": messages}
+
+
+async def _dispatch_list_tools(session, params):
+    return await _fetch_tool_dicts(session)
+
+
+async def _dispatch_call_tool(session, params):
+    try:
+        result = await _call_tool_robust(session, params["name"], params.get("arguments", {}))
+    except BaseException as exc:
+        return {"__error__": _exc_message(exc)}
+    if _is_error(result):
+        return {"__error__": render_tool_result(result)}
+    return render_tool_result(result)
+
+
+async def _dispatch_list_resources(session, params):
+    return await _fetch_resource_dicts(session)
+
+
+async def _dispatch_read_resource(session, params):
+    return await _read_resource_robust(session, params["uri"])
+
+
+async def _dispatch_list_resource_templates(session, params):
+    return await _fetch_template_dicts(session)
+
+
+async def _dispatch_list_prompts(session, params):
+    return await _fetch_prompt_dicts(session)
+
+
+async def _dispatch_get_prompt(session, params):
+    return await _get_prompt_robust(session, params["name"], params.get("arguments", {}))
 
 
 _SESSION_DISPATCH = {
@@ -3330,8 +4047,6 @@ def _run_session_daemon(config_json: str):
         return await handler(session, params)
 
     async def _daemon():
-        from mcp import ClientSession
-
         async def _run_with_session(session):
             await session.initialize()
 
@@ -3430,47 +4145,9 @@ def _run_session_daemon(config_json: str):
                 meta_path.unlink(missing_ok=True)
 
         if is_stdio:
-            from mcp.client.stdio import StdioServerParameters, stdio_client
-
-            parts = shlex.split(source)
-            env = {**os.environ, **env_vars}
-            params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await _run_with_session(session)
+            await _connect_stdio(source, env_vars, _run_with_session)
         else:
-            headers = dict(auth_headers) if auth_headers else None
-
-            async def _via_streamable():
-                from mcp.client.streamable_http import streamable_http_client
-                try:
-                    from mcp.client.streamable_http import create_mcp_http_client
-                except ImportError:  # mcp>=2.1 moved it to _httpx_utils
-                    from mcp.shared._httpx_utils import create_mcp_http_client
-
-                http_client = create_mcp_http_client(headers=headers)
-                async with streamable_http_client(
-                    source, http_client=http_client
-                ) as (read, write):
-                    async with ClientSession(read, write) as session:
-                        await _run_with_session(session)
-
-            async def _via_sse():
-                from mcp.client.sse import sse_client
-
-                async with sse_client(source, headers=headers) as (read, write):
-                    async with ClientSession(read, write) as session:
-                        await _run_with_session(session)
-
-            if transport == "sse":
-                await _via_sse()
-            elif transport == "streamable":
-                await _via_streamable()
-            else:
-                try:
-                    await _via_streamable()
-                except Exception:
-                    await _via_sse()
+            await _connect_http(source, auth_headers, transport, None, _run_with_session)
 
     anyio.run(_daemon)
 
@@ -3696,7 +4373,7 @@ def handle_mcp(
         source, is_stdio, auth_headers, env_vars,
         cmd.tool_name, arguments, False, pretty, raw, key, ttl, refresh,
         toon=toon, transport=transport, oauth_provider=oauth_provider,
-        json_output=json_output,
+        head=head, json_output=json_output,
     )
 
     # Record usage after successful execution
@@ -3713,82 +4390,19 @@ def _fetch_mcp_tools(
 ) -> list[dict]:
     tools_result: list[dict] = []
 
-    async def _extract_tools(session):
-        result = await session.list_tools()
-        tools_result.extend(
-            {
-                "name": t.name,
-                "description": t.description or "",
-                "inputSchema": _tool_schema(t),
-            }
-            for t in result.tools
-        )
+    async def _work(session):
+        await session.initialize()
+        tools_result.extend(await _fetch_tool_dicts(session))
 
     async def _run():
-        nonlocal tools_result
-
         if is_stdio:
-            from mcp import ClientSession
-            from mcp.client.stdio import StdioServerParameters, stdio_client
-
-            parts = shlex.split(source)
-            env = {**os.environ, **env_vars}
-            params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    await _extract_tools(session)
+            await _connect_stdio(source, env_vars, _work)
         else:
-            from mcp import ClientSession
+            await _connect_http(
+                source, auth_headers, transport, oauth_provider, _work
+            )
 
-            headers = dict(auth_headers) if auth_headers else None
-
-            effective_transport = _resolve_transport(source, transport)
-
-            async def _with_streamable():
-                from mcp.client.streamable_http import streamable_http_client
-                try:
-                    from mcp.client.streamable_http import create_mcp_http_client
-                except ImportError:  # mcp>=2.1 moved it to _httpx_utils
-                    from mcp.shared._httpx_utils import create_mcp_http_client
-
-                http_client = create_mcp_http_client(
-                    headers=headers, auth=oauth_provider
-                )
-                async with streamable_http_client(
-                    source, http_client=http_client
-                ) as (read, write):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        await _extract_tools(session)
-
-            async def _via_sse():
-                from mcp.client.sse import sse_client
-
-                async with sse_client(source, headers=headers, auth=oauth_provider) as (
-                    read,
-                    write,
-                ):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        await _extract_tools(session)
-
-            if effective_transport == "sse":
-                await _via_sse()
-            elif effective_transport == "streamable":
-                await _with_streamable()
-            else:  # auto
-                try:
-                    await _with_streamable()
-                except Exception as e:
-                    if _is_transport_unsupported(e):
-                        print(f"[mcp2cli] streamable HTTP transport unavailable ({e!r}); falling back to SSE", file=sys.stderr)
-                        await _via_sse()
-                    else:
-                        print(f"[mcp2cli] streamable HTTP transport failed: {e!r} (not a transport-unsupported condition); not falling back to SSE", file=sys.stderr)
-                        raise
-
-    anyio.run(_run)
+    run_mcp_async(_run, source=source, is_stdio=is_stdio)
     return tools_result
 
 
@@ -3841,15 +4455,32 @@ def _split_at_subcommand(
 
 
 def main():
-    if len(sys.argv) > 1:
-        first = sys.argv[1]
+    try:
+        _dispatch_main(sys.argv[1:])
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:  # pragma: no cover - interactive only
+        print("Interrupted.", file=sys.stderr)
+        sys.exit(130)
+    except BrokenPipeError:  # pragma: no cover - `| head` closes stdout
+        sys.exit(0)
+    except BaseException as exc:  # noqa: BLE001 - one clean line, never a traceback
+        if os.environ.get("MCP2CLI_DEBUG"):
+            raise
+        print(f"Error: {_exc_message(exc)}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _dispatch_main(argv: list[str]) -> None:
+    if argv:
+        first = argv[0]
         if first == "bake":
-            _handle_bake(sys.argv[2:])
+            _handle_bake(argv[1:])
             return
         if first.startswith("@"):
-            _run_baked(first[1:], sys.argv[2:])
+            _run_baked(first[1:], argv[1:])
             return
-    _main_impl(sys.argv[1:])
+    _main_impl(argv)
 
 
 def _build_main_parser() -> argparse.ArgumentParser:
@@ -3965,6 +4596,16 @@ def _build_main_parser() -> argparse.ArgumentParser:
         choices=["auto", "sse", "streamable"],
         default="auto",
         help="MCP HTTP transport: 'auto' tries streamable then SSE, 'sse' skips streamable, 'streamable' skips SSE fallback",
+    )
+    pre.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        metavar="SECONDS",
+        help=(
+            f"Read timeout for MCP requests and HTTP calls (default: {DEFAULT_TIMEOUT:.0f}). "
+            "Raise it for long-running tools; lower it to fail fast."
+        ),
     )
     pre.add_argument(
         "--env",
@@ -4201,7 +4842,15 @@ def _handle_session_operations(
     sess_name = pre_args.session
     _sess_out = dict(
         pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon,
-        json_output=pre_args.json_output,
+        head=pre_args.head, json_output=pre_args.json_output,
+    )
+    # Session mode gets the same --list shaping as a direct connection:
+    # --compact/--top/--sort are the flags that keep agent token cost down.
+    _sess_list = dict(
+        verbose=pre_args.verbose, compact=pre_args.compact,
+        source_hash=_source_hash_for(pre_args.session or ""),
+        sort_mode=pre_args.sort_mode, top=pre_args.top,
+        json_output=pre_args.json_output, pretty=pre_args.pretty,
     )
 
     if pre_args.list_resources:
@@ -4242,34 +4891,25 @@ def _handle_session_operations(
             commands = _filter_commands(commands, search_pattern)
             if not commands:
                 if pre_args.json_output:
-                    list_mcp_commands(
-                        commands, verbose=pre_args.verbose,
-                        json_output=True, pretty=pre_args.pretty,
-                    )
+                    list_mcp_commands(commands, **_sess_list)
                 else:
                     print(f"\nNo tools matching '{search_pattern}'.")
                 return True
-            if not pre_args.json_output:
+            if not pre_args.json_output and not pre_args.compact:
                 print(f"\nTools matching '{search_pattern}':")
-        elif not pre_args.json_output:
+        elif not pre_args.json_output and not pre_args.compact:
             print("\nAvailable tools:")
-        list_mcp_commands(
-            commands, verbose=pre_args.verbose,
-            json_output=pre_args.json_output, pretty=pre_args.pretty,
-        )
+        list_mcp_commands(commands, **_sess_list)
         return True
 
     # Tool call via session
     if not remaining:
         result = _session_request(sess_name, "list_tools")
         commands = extract_mcp_commands(result)
-        if not pre_args.json_output:
+        if not pre_args.json_output and not pre_args.compact:
             print("Available tools:")
-        list_mcp_commands(
-            commands, verbose=pre_args.verbose,
-            json_output=pre_args.json_output, pretty=pre_args.pretty,
-        )
-        if not pre_args.json_output:
+        list_mcp_commands(commands, **_sess_list)
+        if not pre_args.json_output and not pre_args.compact:
             print("\nUse --list for the same output, or provide a subcommand.")
         return True
 
@@ -4415,7 +5055,8 @@ def _handle_openapi_mode(
     execute_openapi(
         args, cmd, base_url, auth_headers,
         pre_args.pretty, pre_args.raw, toon=pre_args.toon,
-        oauth_provider=oauth_provider, json_output=pre_args.json_output,
+        oauth_provider=oauth_provider, head=pre_args.head,
+        json_output=pre_args.json_output,
     )
 
     # Record usage after successful execution
@@ -4423,6 +5064,7 @@ def _handle_openapi_mode(
 
 
 def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
+    global _TIMEOUT
     pre = _build_main_parser()
 
     # Split argv at the subcommand boundary so that tool parameters whose
@@ -4431,6 +5073,9 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
     global_argv, tool_argv = _split_at_subcommand(argv, pre)
     pre_args, leftover = pre.parse_known_args(global_argv)
     remaining = leftover + tool_argv
+
+    if pre_args.timeout is not None and pre_args.timeout > 0:
+        _TIMEOUT = pre_args.timeout
 
     # --search implies --list
     search_pattern = pre_args.search_pattern
