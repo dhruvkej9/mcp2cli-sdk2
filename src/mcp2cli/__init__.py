@@ -3627,10 +3627,10 @@ def _fetch_mcp_tools(
             if effective_transport == "sse":
                 await _via_sse()
             elif effective_transport == "streamable":
-                await _via_streamable()
+                await _with_streamable()
             else:  # auto
                 try:
-                    await _via_streamable()
+                    await _with_streamable()
                 except Exception as e:
                     if _is_transport_unsupported(e):
                         print(f"[mcp2cli] streamable HTTP transport unavailable ({e!r}); falling back to SSE", file=sys.stderr)
