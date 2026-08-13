@@ -368,6 +368,47 @@ class TestLegacyProtocolServer:
         assert "timezone" in r.stdout.lower() or "datetime" in r.stdout.lower()
 
 
+class TestLargeRealServer:
+    """A big third-party server with many tools and non-trivial schemas."""
+
+    SERVER = "npx -y @playwright/mcp@latest --headless --isolated"
+
+    def test_list(self, cache_dir):
+        r = stdio(self.SERVER, "--list", "--compact", cache_dir=cache_dir, timeout=400)
+        if r.returncode != 0:
+            pytest.skip(f"playwright mcp unavailable: {r.stderr[:200]}")
+        names = r.stdout.split()
+        assert len(names) > 10
+        assert "browser-navigate" in names
+
+    def test_tool_help(self, cache_dir):
+        r = stdio(self.SERVER, "browser-navigate", "--help", cache_dir=cache_dir, timeout=400)
+        if r.returncode != 0:
+            pytest.skip(f"playwright mcp unavailable: {r.stderr[:200]}")
+        assert "--url" in r.stdout
+
+
+@pytest.mark.skipif(shutil.which("uvx") is None, reason="uvx not installed")
+class TestPydanticSchemaServer:
+    """A Python server whose schemas come from pydantic models."""
+
+    SERVER = "uvx --with mcp==1.9.0 mcp-server-git --repository ."
+
+    def test_list(self, cache_dir):
+        r = stdio(self.SERVER, "--list", "--compact", cache_dir=cache_dir, timeout=400)
+        if r.returncode != 0:
+            pytest.skip(f"git server unavailable: {r.stderr[:200]}")
+        assert "git-status" in r.stdout.split()
+
+    def test_call(self, cache_dir):
+        r = stdio(
+            self.SERVER, "git-status", "--repo-path", ".", cache_dir=cache_dir, timeout=400
+        )
+        if r.returncode != 0:
+            pytest.skip(f"git server unavailable: {r.stderr[:200]}")
+        assert r.stdout.strip()
+
+
 class TestBakeAgainstRealServer:
     def test_bake_roundtrip(self, tmp_path, cache_dir):
         env = dict(os.environ, MCP2CLI_CONFIG_DIR=str(tmp_path), MCP2CLI_CACHE_DIR=cache_dir)

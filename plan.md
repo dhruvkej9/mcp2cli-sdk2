@@ -23,8 +23,17 @@ purpose-built "hostile but protocol-legal" server:
 | `@modelcontextprotocol/server-filesystem` | stdio |
 | `@modelcontextprotocol/server-memory` | stdio (array-of-objects params) |
 | `@modelcontextprotocol/server-sequential-thinking` | stdio |
-| `mcp-server-time` pinned to `mcp==1.9.0` | stdio — a genuine **MCP 1.x** server |
+| `mcp-server-time`, `mcp-server-git` pinned to `mcp==1.9.0` | stdio — genuine **MCP 1.x** servers with pydantic schemas |
+| `@playwright/mcp` | stdio — a large third-party server (24 tools) |
+| `mcp.context7.com/mcp`, `mcp.deepwiki.com/mcp` | hosted production servers over streamable HTTP |
 | `tests/hostile_server.py` | raw JSON-RPC, every awkward-but-legal shape |
+
+Two servers (`mcp-server-time`, `mcp-server-git` unpinned) fail on their own
+bug — their published code calls `McpError` / `Server.list_tools`, which no
+longer exist in the `mcp` 2.x they resolve to. mcp2cli now reports exactly that
+("closed the connection before the handshake completed … check the server's own
+stderr") instead of a traceback, and works fine against the same servers pinned
+to a version that starts.
 
 ---
 
@@ -153,8 +162,8 @@ purpose-built "hostile but protocol-legal" server:
   behaves identically to a direct connection (pagination, content blocks, clean
   errors, list shaping) plus the socket-path length fallback.
 - [x] `tests/test_real_servers.py` — opt-in integration suite against the real
-  everything / filesystem / memory servers over stdio, streamable HTTP and SSE,
-  plus a genuine MCP 1.x server and a bake round-trip. Skipped unless
+  everything / filesystem / memory / playwright / git servers over stdio,
+  streamable HTTP and SSE, plus a genuine MCP 1.x server and a bake round-trip. Skipped unless
   `MCP2CLI_TEST_REAL=1`, so the default suite stays hermetic.
 - [x] `pyproject.toml` — registered markers (`real`, `slow`),
   `--strict-markers`, `asyncio_mode`, `testpaths`.
