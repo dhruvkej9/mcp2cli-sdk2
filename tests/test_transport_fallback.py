@@ -181,3 +181,16 @@ class TestHttpClientConfig:
     def test_mcp_http_client_carries_headers(self):
         client = mcp2cli._create_mcp_http_client({"X-Test": "1"})
         assert client.headers.get("X-Test") == "1"
+
+    def test_oauth_spec_mode_reaches_the_network(self):
+        """End-to-end regression: OAuth in --spec mode used to die at client
+        construction with `TypeError: Invalid "auth" argument`, before any
+        request was made. It must now get as far as a connection error."""
+        r = run_cli(
+            "--spec", "http://127.0.0.1:9/openapi.json",
+            "--oauth-client-id", "id", "--oauth-client-secret", "secret",
+            "--list",
+        )
+        assert r.returncode == 1
+        assert "Invalid" not in r.stderr and "auth" not in r.stderr.lower()
+        assert "Traceback (most recent call last)" not in r.stderr

@@ -351,6 +351,14 @@ class TestHostileNames:
         assert mcp2cli.to_cli_name("--weird--") == "weird"
         assert mcp2cli.to_cli_name("") == "tool"
 
+    def test_non_ascii_names_survive(self):
+        """A non-Latin name must stay addressable, not collapse to a placeholder."""
+        assert mcp2cli.to_cli_name("検索ツール") == "検索ツール"
+
+    def test_shell_metacharacters_are_neutralised(self):
+        assert mcp2cli.to_cli_name("a$(rm -rf)b") == "a-rm-rf-b"
+        assert mcp2cli.to_cli_name("tool|pipe") == "tool-pipe"
+
 
 class TestUniversalEscapeHatch:
     """Every MCP tool accepts raw JSON, not just schema-less ones."""

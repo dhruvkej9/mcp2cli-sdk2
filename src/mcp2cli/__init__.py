@@ -323,14 +323,17 @@ def to_kebab(name: str) -> str:
     return s.replace("_", "-").lower()
 
 
-_UNSAFE_NAME_CHARS = re.compile(r"[^a-z0-9.-]+")
+# Characters that break a shell word or argparse. Everything else — including
+# non-ASCII letters — is left alone, so a server with Japanese or Cyrillic tool
+# names stays addressable instead of collapsing to a placeholder.
+_UNSAFE_NAME_CHARS = re.compile(r"""[\s/\\'"`|;&<>()$*?\[\]{}!#=,:]+""")
 
 
 def to_cli_name(name: str) -> str:
     """Kebab-case a server-side name into something typable as a CLI word.
 
     Real servers publish names like ``browser/navigate``, ``Slack.postMessage``
-    and ``search files``. The wire name is kept on the CommandDef, so mangling
+    and ``search files``. The wire name is kept on the CommandDef, so reshaping
     the display name here is free.
     """
     cli = _UNSAFE_NAME_CHARS.sub("-", to_kebab(name or ""))

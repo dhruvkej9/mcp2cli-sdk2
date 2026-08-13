@@ -6,9 +6,9 @@ against real servers. Nothing is deferred except the two items under
 
 Baseline before this work (2026-08-14): `uv run pytest tests/` → **369 passed**,
 all against in-repo fakes. None of the failures below were caught by them.
-After: **505 hermetic tests pass** (32 real-server tests skipped by default),
-and `MCP2CLI_TEST_REAL=1 uv run pytest tests/test_real_servers.py` → **32
-passed** against the real npx servers over stdio, streamable HTTP and SSE.
+After: **508 hermetic tests pass** (36 real-server tests skipped by default),
+and `MCP2CLI_TEST_REAL=1 uv run pytest tests/test_real_servers.py` → **36
+passed** against real published servers over stdio, streamable HTTP and SSE.
 
 ---
 
@@ -120,7 +120,8 @@ to a version that starts.
 - [x] **13. Booleans could only ever be sent as `true`.** Now `--flag` /
   `--no-flag` via `argparse.BooleanOptionalAction`.
 - [x] **14. Tool names that are not valid CLI words** (`browser/navigate`,
-  `Slack.postMessage`, `search files`) are sanitized into typable commands.
+  `Slack.postMessage`, `search files`, shell metacharacters) are reshaped into
+  typable commands; non-ASCII names are left intact rather than flattened.
 - [x] **15. Two properties kebab-ing to the same flag** (`fooBar`, `foo_bar`)
   silently dropped one; they now become `--foo-bar` and `--foo-bar-2`.
 - [x] **16. A raw escape hatch on every MCP tool** — `--stdin`, `--json '{…}'`
