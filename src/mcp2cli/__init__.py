@@ -2543,11 +2543,11 @@ def run_mcp_http(
         effective_transport = _resolve_transport(url, transport)
 
         async def _with_streamable():
-            from mcp.client.streamable_http import (
-                create_mcp_http_client,
-                streamable_http_client,
-            )
-
+            from mcp.client.streamable_http import streamable_http_client
+            try:
+                from mcp.client.streamable_http import create_mcp_http_client
+            except ImportError:  # mcp>=2.1 moved it to _httpx_utils
+                from mcp.shared._httpx_utils import create_mcp_http_client
             http_client = create_mcp_http_client(
                 headers=headers, auth=oauth_provider
             )
@@ -3286,10 +3286,11 @@ def _run_session_daemon(config_json: str):
             headers = dict(auth_headers) if auth_headers else None
 
             async def _via_streamable():
-                from mcp.client.streamable_http import (
-                    create_mcp_http_client,
-                    streamable_http_client,
-                )
+                from mcp.client.streamable_http import streamable_http_client
+                try:
+                    from mcp.client.streamable_http import create_mcp_http_client
+                except ImportError:  # mcp>=2.1 moved it to _httpx_utils
+                    from mcp.shared._httpx_utils import create_mcp_http_client
 
                 http_client = create_mcp_http_client(headers=headers)
                 async with streamable_http_client(
@@ -3595,11 +3596,12 @@ def _fetch_mcp_tools(
 
             effective_transport = _resolve_transport(source, transport)
 
-            async def _via_streamable():
-                from mcp.client.streamable_http import (
-                    create_mcp_http_client,
-                    streamable_http_client,
-                )
+            async def _with_streamable():
+                from mcp.client.streamable_http import streamable_http_client
+                try:
+                    from mcp.client.streamable_http import create_mcp_http_client
+                except ImportError:  # mcp>=2.1 moved it to _httpx_utils
+                    from mcp.shared._httpx_utils import create_mcp_http_client
 
                 http_client = create_mcp_http_client(
                     headers=headers, auth=oauth_provider
