@@ -141,6 +141,26 @@ PAGE_TWO = [
         "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
     },
     {
+        "name": "roots_probe",
+        "description": "asks the client for its roots and reports them back",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "sampling_probe",
+        "description": "asks the client to sample an LLM; expects a refusal",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "elicit_probe",
+        "description": "asks the client to elicit input; expects a refusal",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "progress_probe",
+        "description": "emits progress notifications, then finishes",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "dup_params",
         "description": "two properties that kebab to the same flag",
         "inputSchema": {
@@ -235,6 +255,30 @@ def _send(msg: dict) -> None:
     sys.stdout.flush()
 
 
+_NEXT_REQUEST_ID = [9000]
+
+
+def _ask_client(method: str, params: dict) -> dict:
+    """Send a server->client request and block for its response.
+
+    Messages that arrive while waiting (notifications, other traffic) are
+    dropped: this is a test fixture, not a conforming implementation.
+    """
+    _NEXT_REQUEST_ID[0] += 1
+    req_id = _NEXT_REQUEST_ID[0]
+    _send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return {"error": {"message": "client closed the connection"}}
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if msg.get("id") == req_id:
+            return msg
+
+
 def _respond(msg_id, result=None, error=None) -> None:
     if msg_id is None:
         return
@@ -246,8 +290,44 @@ def _respond(msg_id, result=None, error=None) -> None:
     _send(resp)
 
 
-def _call_tool(name: str, arguments: dict):
+def _call_tool(name: str, arguments: dict, meta: dict | None = None):
     """Return (result, error) for a tools/call."""
+    if name == "roots_probe":
+        reply = _ask_client("roots/list", {})
+        roots = (reply.get("result") or {}).get("roots", [])
+        return {"content": [{"type": "text", "text": json.dumps(roots)}]}, None
+    if name in ("sampling_probe", "elicit_probe"):
+        method = (
+            "sampling/createMessage"
+            if name == "sampling_probe"
+            else "elicitation/create"
+        )
+        params = (
+            {"messages": [], "maxTokens": 10}
+            if name == "sampling_probe"
+            else {"message": "need input", "requestedSchema": {"type": "object"}}
+        )
+        reply = _ask_client(method, params)
+        payload = {
+            "refused": "error" in reply,
+            "message": (reply.get("error") or {}).get("message", ""),
+        }
+        return {"content": [{"type": "text", "text": json.dumps(payload)}]}, None
+    if name == "progress_probe":
+        token = (meta or {}).get("progressToken")
+        if token is not None:
+            for step in (1, 2, 3):
+                _send({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {
+                        "progressToken": token,
+                        "progress": step,
+                        "total": 3,
+                        "message": f"step {step}",
+                    },
+                })
+        return {"content": [{"type": "text", "text": "progress done"}]}, None
     if name == "whoami":
         return {
             "content": [{"type": "text", "text": json.dumps(SEEN_CLIENT_INFO)}]
@@ -387,8 +467,11 @@ def main() -> None:
         MALFORMED_RESOURCES if mode == "malformed" else []
     )
 
-    for line in sys.stdin:
-        line = line.strip()
+    while True:
+        raw_line = sys.stdin.readline()
+        if not raw_line:
+            break
+        line = raw_line.strip()
         if not line:
             continue
         try:
@@ -407,7 +490,13 @@ def main() -> None:
                 msg_id,
                 {
                     "protocolVersion": params.get("protocolVersion", PROTOCOL_FALLBACK),
-                    "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                    "capabilities": {
+                        "tools": {},
+                        "resources": {"subscribe": True},
+                        "prompts": {},
+                        "logging": {},
+                        "completions": {},
+                    },
                     "serverInfo": {"name": "hostile-server", "version": "1.0.0"},
                     # Echo what the client told us about itself so tests can
                     # assert mcp2cli identifies itself.
@@ -426,8 +515,34 @@ def main() -> None:
             else:
                 _respond(msg_id, {"tools": page_one})
         elif method == "tools/call":
-            result, error = _call_tool(params.get("name", ""), params.get("arguments") or {})
+            result, error = _call_tool(
+                params.get("name", ""),
+                params.get("arguments") or {},
+                params.get("_meta") or {},
+            )
             _respond(msg_id, result, error)
+        elif method == "completion/complete":
+            argument = params.get("argument") or {}
+            prefix = argument.get("value", "")
+            pool = ["Engineering", "Marketing", "Sales", "Support"]
+            values = [v for v in pool if v.lower().startswith(prefix.lower())]
+            _respond(
+                msg_id,
+                {"completion": {"values": values, "total": len(values), "hasMore": False}},
+            )
+        elif method == "logging/setLevel":
+            _respond(msg_id, {})
+            _send({
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {
+                    "level": params.get("level", "info"),
+                    "logger": "hostile",
+                    "data": "log level accepted",
+                },
+            })
+        elif method in ("resources/subscribe", "resources/unsubscribe"):
+            _respond(msg_id, {})
         elif method == "resources/list":
             if cursor == "page2":
                 _respond(msg_id, {"resources": RESOURCES_PAGE_TWO})

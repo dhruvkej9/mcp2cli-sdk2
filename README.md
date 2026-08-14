@@ -58,7 +58,16 @@ uvx --from git+https://github.com/dhruvkej9/mcp2cli-sdk2.git mcp2cli --help
 >   persistent sessions.
 > - **Transport auto-detection** — `auto` prefers streamable HTTP and retries
 >   over SSE when the endpoint genuinely does not implement it; an auth failure
->   is reported instead of being hidden behind a pointless retry.
+>   is reported as `authentication failed (HTTP 401)` instead of being hidden
+>   behind a pointless retry.
+> - **Authenticated servers** — credentials ride *every* request, not just the
+>   handshake, over both streamable HTTP and SSE (where the call travels to a
+>   different endpoint than the handshake), and through baked configs and
+>   session daemons.
+> - **Server→client requests** — `roots/list` is answered from `--root`;
+>   `sampling/createMessage` and `elicitation/create` are declined with an
+>   explanation rather than an opaque "method not found"; progress
+>   notifications and server logs surface with `--log-level`.
 
 ## AI Agent Skill
 
@@ -299,6 +308,15 @@ mcp2cli --spec ./spec.json --raw get-data
 # Truncate large responses to first N records
 mcp2cli --spec ./spec.json list-records --head 5
 
+# Give the server a workspace root (servers that scope themselves ask for these)
+mcp2cli --mcp-stdio "npx @modelcontextprotocol/server-filesystem /srv" --root /srv --list
+
+# Watch what the server is doing: its logs plus tool progress, on stderr
+mcp2cli --mcp $URL --log-level info long-running-tool
+
+# Ask the server to complete an argument value
+mcp2cli --mcp $URL --complete 'my-prompt:city=San'
+
 # Pipe-friendly (compact JSON when not a TTY)
 mcp2cli --spec ./spec.json list-pets | jq '.[] | .name'
 
@@ -343,6 +361,10 @@ Options:
   --base-url URL          Override base URL from spec
   --transport TYPE        MCP HTTP transport: auto|sse|streamable (default: auto)
   --timeout SECONDS       Read timeout for MCP requests and HTTP calls (default: 300)
+  --root PATH|URI         Expose a filesystem root to the server (repeatable)
+  --log-level LEVEL       Ask the server for logs at this level; prints logs and
+                          tool progress on stderr
+  --complete REF:ARG=PRE  Ask the server to complete an argument value
   --env KEY=VALUE         Env var for MCP stdio server (repeatable)
   --oauth                 Enable OAuth (authorization code + PKCE flow)
   --oauth-client-id ID    OAuth client ID (supports env:/file: prefixes)
@@ -400,6 +422,9 @@ mcp2cli --mcp https://mcp.example.com/mcp search --json '{"query": "test", "filt
 # Install with test + MCP deps
 uv sync --extra test
 
+# Or with pip (requirements files are generated from uv.lock)
+pip install -r requirements-dev.txt
+
 # Run the hermetic suite (no network) — OpenAPI, GraphQL, MCP stdio/HTTP,
 # caching, token savings, plus the robustness and transport suites
 uv run pytest tests/
@@ -425,6 +450,8 @@ uv run pytest tests/test_token_savings.py -v -s
 | `tests/test_robustness.py` | pagination, name collisions, reserved flag names, odd enums/unions, content blocks, out-of-spec payloads, clean error surfaces |
 | `tests/test_transport_fallback.py` | streamable ⇄ SSE selection, and that auth failures never trigger a retry |
 | `tests/test_sessions.py` | the persistent session daemon behaves identically to a direct connection |
+| `tests/test_auth.py` | bearer/API-key servers — listing **and calling** over streamable HTTP and SSE, via env:/file: secrets, baked configs and sessions |
+| `tests/test_abapfs_server.py` | an ABAP FS-style server: stateful `Mcp-Session-Id`, bare-token auth, real SAP tool schemas |
 | `tests/test_real_servers.py` | the same behaviour against real published servers (opt-in) |
 | `tests/test_cache.py`, `test_bake.py`, `test_usage.py`, `test_oauth.py` | caching, baked configs, usage ranking, OAuth wiring |
 

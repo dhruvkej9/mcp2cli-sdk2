@@ -409,6 +409,114 @@ class TestPydanticSchemaServer:
         assert r.stdout.strip()
 
 
+class TestUi5Server:
+    """SAP UI5 tooling server — enum-constrained params, snake_case wire names."""
+
+    SERVER = "npx -y @ui5/mcp-server"
+
+    def test_list(self, cache_dir):
+        r = stdio(self.SERVER, "--list", "--compact", cache_dir=cache_dir, timeout=400)
+        if r.returncode != 0:
+            pytest.skip(f"ui5 mcp unavailable: {r.stderr[:200]}")
+        names = r.stdout.split()
+        assert "get-version-info" in names
+        assert "get-guidelines" in names
+
+    def test_enum_flag_is_generated(self, cache_dir):
+        r = stdio(
+            self.SERVER, "get-version-info", "--help", cache_dir=cache_dir, timeout=400
+        )
+        if r.returncode != 0:
+            pytest.skip(f"ui5 mcp unavailable: {r.stderr[:200]}")
+        assert "--framework-name" in r.stdout
+        assert "OpenUI5" in r.stdout
+
+    def test_call_with_enum_value(self, cache_dir):
+        r = stdio(
+            self.SERVER, "get-version-info", "--framework-name", "OpenUI5",
+            cache_dir=cache_dir, timeout=400,
+        )
+        if r.returncode != 0:
+            pytest.skip(f"ui5 mcp unavailable: {r.stderr[:200]}")
+        assert "version" in r.stdout.lower()
+
+    def test_missing_required_arg_is_a_clean_error(self, cache_dir):
+        """The server's own validation must surface as one line, not a traceback."""
+        r = stdio(self.SERVER, "get-version-info", cache_dir=cache_dir, timeout=400)
+        if r.returncode == 0:
+            pytest.skip("server accepted the call without the required argument")
+        assert "Traceback (most recent call last)" not in r.stderr
+        assert "Error:" in r.stderr
+
+
+class TestCapCdsServer:
+    """SAP CAP CDS server."""
+
+    SERVER = "npx -y @cap-js/mcp-server"
+
+    def test_list(self, cache_dir):
+        r = stdio(self.SERVER, "--list", "--compact", cache_dir=cache_dir, timeout=400)
+        if r.returncode != 0:
+            pytest.skip(f"cds mcp unavailable: {r.stderr[:200]}")
+        assert "search-docs" in r.stdout.split()
+
+    def test_search_docs(self, cache_dir):
+        r = stdio(
+            self.SERVER, "search-docs", "--query", "service definition",
+            cache_dir=cache_dir, timeout=400,
+        )
+        if r.returncode != 0:
+            pytest.skip(f"cds mcp unavailable: {r.stderr[:200]}")
+        assert r.stdout.strip()
+
+    def test_numeric_param(self, cache_dir):
+        r = stdio(
+            self.SERVER, "search-docs", "--query", "entity", "--max-results", "2",
+            cache_dir=cache_dir, timeout=400,
+        )
+        if r.returncode != 0:
+            pytest.skip(f"cds mcp unavailable: {r.stderr[:200]}")
+        assert r.stdout.strip()
+
+
+class TestExaServer:
+    """Exa search — the same server reachable over stdio and hosted HTTP."""
+
+    STDIO = "npx -y exa-mcp-server"
+    HOSTED = "https://mcp.exa.ai/mcp"
+
+    def test_stdio_list(self, cache_dir):
+        r = stdio(self.STDIO, "--list", "--compact", cache_dir=cache_dir, timeout=400)
+        if r.returncode != 0:
+            pytest.skip(f"exa stdio unavailable: {r.stderr[:200]}")
+        assert "web-search-exa" in r.stdout.split()
+
+    def test_hosted_list(self, cache_dir):
+        r = run_cli("--mcp", self.HOSTED, "--refresh", "--list", "--compact",
+                    cache_dir=cache_dir)
+        if r.returncode != 0:
+            pytest.skip(f"exa hosted unavailable: {r.stderr[:200]}")
+        assert "web-search-exa" in r.stdout.split()
+
+    def test_hosted_search_call(self, cache_dir):
+        r = run_cli(
+            "--mcp", self.HOSTED, "--refresh",
+            "web-search-exa", "--query", "model context protocol", "--num-results", "2",
+            cache_dir=cache_dir,
+        )
+        if r.returncode != 0:
+            pytest.skip(f"exa hosted unavailable: {r.stderr[:200]}")
+        assert len(r.stdout) > 50
+
+    def test_hosted_and_stdio_expose_the_same_tools(self, cache_dir):
+        hosted = run_cli("--mcp", self.HOSTED, "--refresh", "--list", "--compact",
+                         cache_dir=cache_dir)
+        piped = stdio(self.STDIO, "--list", "--compact", cache_dir=cache_dir, timeout=400)
+        if hosted.returncode != 0 or piped.returncode != 0:
+            pytest.skip("exa unavailable over one of the transports")
+        assert set(hosted.stdout.split()) == set(piped.stdout.split())
+
+
 class TestBakeAgainstRealServer:
     def test_bake_roundtrip(self, tmp_path, cache_dir):
         env = dict(os.environ, MCP2CLI_CONFIG_DIR=str(tmp_path), MCP2CLI_CACHE_DIR=cache_dir)

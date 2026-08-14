@@ -55,6 +55,9 @@ DEFAULT_TIMEOUT = 300.0
 # call sites; one CLI invocation has exactly one timeout. Make it a parameter
 # if mcp2cli ever runs more than one source per process.
 _TIMEOUT = DEFAULT_TIMEOUT
+# Client-side capabilities the user opted into (see --root / --log-level).
+_ROOTS: list[str] = []
+_LOG_LEVEL: str | None = None
 MAX_PAGES = 1000
 USAGE_FILE = CACHE_DIR / "usage.json"
 CONFIG_DIR = Path(
@@ -302,9 +305,13 @@ def coerce_value(value, schema: dict):
             return value
     if t == "number":
         try:
-            return float(value)
+            number = float(value)
         except (TypeError, ValueError):
             return value
+        # Send 5 rather than 5.0 for a whole number: both are valid JSON
+        # numbers, but plenty of servers declare "number" and then validate
+        # with an integer checker (zod .int(), pydantic int).
+        return int(number) if number.is_integer() else number
     # Schema-less fallback: try to parse JSON objects/arrays from strings
     if t is None and isinstance(value, str):
         stripped = value.strip()
@@ -2829,10 +2836,20 @@ async def _connect_http(
             async with _client_session(read, write) as session:
                 return await work(session)
 
+    async def _explicit(transport_fn):
+        """Run a pinned transport, naming an auth failure if that is what it is."""
+        try:
+            return await transport_fn()
+        except BaseException as exc:  # noqa: BLE001 - enrich, then re-raise
+            if _surface_tool_error_present(exc):
+                raise
+            await _raise_if_auth_failure(url, headers, oauth_provider, exc)
+            raise
+
     if effective_transport == "sse":
-        return await _with_sse()
+        return await _explicit(_with_sse)
     if effective_transport == "streamable":
-        return await _with_streamable()
+        return await _explicit(_with_streamable)
     try:
         return await _with_streamable()
     except BaseException as exc:  # noqa: BLE001 - decide, then re-raise
@@ -2900,13 +2917,31 @@ async def _probe_http_status(url: str, headers, auth) -> int | None:
         return None
 
 
+def _raise_auth_error(url: str, status: int | None) -> None:
+    """Report an authentication failure in terms the user can act on."""
+    _raise_tool_error(
+        f"authentication failed (HTTP {status or 401}) for {url}. "
+        "Pass credentials with --auth-header 'Authorization:Bearer <token>' "
+        "(values support env:VAR and file:/path), or use --oauth."
+    )
+
+
+async def _raise_if_auth_failure(url: str, headers, auth, exc: BaseException) -> int | None:
+    """Turn an opaque transport failure into a clear auth error when it is one.
+
+    The SDK reports a 401 as ``MCPError(-32603, "Server returned an error
+    response")``, which tells the user nothing. Probing the endpoint recovers
+    the status, so a missing token reads as a missing token.
+    """
+    status = await _probe_http_status(url, headers, auth)
+    if _is_auth_failure(exc) or status in _AUTH_STATUS:
+        _raise_auth_error(url, status)
+    return status
+
+
 async def _should_retry_over_sse(url: str, headers, auth, exc: BaseException) -> bool:
     """Decide whether a failed streamable attempt deserves an SSE retry."""
-    if _is_auth_failure(exc):
-        return False
-    status = await _probe_http_status(url, headers, auth)
-    if status in _AUTH_STATUS:
-        return False
+    status = await _raise_if_auth_failure(url, headers, auth, exc)
     if status is None:
         # The endpoint could not be probed at all; fall back only on the
         # exception shapes that are unambiguous on their own.
@@ -2947,6 +2982,7 @@ def run_mcp_http(
     prompt_action: str | None = None,
     prompt_name: str | None = None,
     prompt_arguments: dict | None = None,
+    complete_spec: str | None = None,
     search_pattern: str | None = None,
     head: int | None = None,
     verbose: bool = False,
@@ -2962,6 +2998,7 @@ def run_mcp_http(
         prompt_action=prompt_action,
         prompt_name=prompt_name,
         prompt_arguments=prompt_arguments,
+        complete_spec=complete_spec,
         search_pattern=search_pattern,
         head=head,
         verbose=verbose,
@@ -2974,7 +3011,7 @@ def run_mcp_http(
 
     async def _run():
         async def _work(session):
-            await session.initialize()
+            await _initialize(session)
             return await _mcp_session(
                 session,
                 tool_name,
@@ -3013,6 +3050,7 @@ def run_mcp_stdio(
     prompt_action: str | None = None,
     prompt_name: str | None = None,
     prompt_arguments: dict | None = None,
+    complete_spec: str | None = None,
     search_pattern: str | None = None,
     head: int | None = None,
     verbose: bool = False,
@@ -3028,6 +3066,7 @@ def run_mcp_stdio(
         prompt_action=prompt_action,
         prompt_name=prompt_name,
         prompt_arguments=prompt_arguments,
+        complete_spec=complete_spec,
         search_pattern=search_pattern,
         head=head,
         verbose=verbose,
@@ -3040,7 +3079,7 @@ def run_mcp_stdio(
 
     async def _run():
         async def _work(session):
-            await session.initialize()
+            await _initialize(session)
             await _mcp_session(
                 session,
                 tool_name,
@@ -3176,6 +3215,7 @@ async def _mcp_session(
     prompt_action: str | None = None,
     prompt_name: str | None = None,
     prompt_arguments: dict | None = None,
+    complete_spec: str | None = None,
     search_pattern: str | None = None,
     head: int | None = None,
     verbose: bool = False,
@@ -3185,6 +3225,14 @@ async def _mcp_session(
     source_hash: str = "",
     json_output: bool = False,
 ):
+    # Handle completion requests
+    if complete_spec:
+        await _handle_completion(
+            session, complete_spec, pretty, raw, toon, head=head,
+            json_output=json_output,
+        )
+        return
+
     # Handle resource operations
     if resource_action:
         await _handle_resources(
@@ -3289,6 +3337,62 @@ async def _handle_resources(
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
+
+
+def parse_complete_spec(spec: str) -> tuple[str, str, str]:
+    """Parse ``REF:ARG=PREFIX`` into (ref, argument, prefix).
+
+    ``REF`` is a prompt name, or a resource URI template when it contains
+    ``://`` — in which case the scheme's own colons must not be mistaken for
+    the ref/arg separator.
+    """
+    ref_part, sep, prefix = spec.partition("=")
+    if not sep:
+        print(
+            "Error: --complete expects REF:ARG=PREFIX (e.g. 'my-prompt:city=San')",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    ref, sep, argument = ref_part.rpartition(":")
+    if not sep or not ref or not argument:
+        print(
+            f"Error: --complete could not split {ref_part!r} into REF:ARG",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return ref, argument, prefix
+
+
+async def _handle_completion(
+    session,
+    spec: str,
+    pretty: bool,
+    raw: bool,
+    toon: bool,
+    head: int | None = None,
+    json_output: bool = False,
+):
+    """Run ``completion/complete`` for a prompt or resource-template argument."""
+    from mcp import types
+
+    ref_name, argument, prefix = parse_complete_spec(spec)
+    if "://" in ref_name or "{" in ref_name:
+        ref = types.ResourceTemplateReference(
+            type="ref/resource", uri=ref_name
+        )
+    else:
+        ref = types.PromptReference(type="ref/prompt", name=ref_name)
+
+    result = await session.complete(ref, {"name": argument, "value": prefix})
+    completion = getattr(result, "completion", None)
+    data = {
+        "values": list(getattr(completion, "values", []) or []),
+        "total": getattr(completion, "total", None),
+        "hasMore": getattr(completion, "has_more", None),
+    }
+    output_result(
+        data, pretty=pretty, raw=raw, toon=toon, head=head, json_output=json_output
+    )
 
 
 async def _handle_prompts(
@@ -3613,8 +3717,77 @@ def _mcp_client_info():
         return None
 
 
+def _roots_callback():
+    """Answer ``roots/list`` from --root, or None when none were given.
+
+    Servers that scope themselves to a workspace (filesystem, git, IDE-style
+    servers) ask the client for roots and fall back to something narrower when
+    the client offers none — the filesystem server literally logs "Client does
+    not support MCP Roots".
+    """
+    if not _ROOTS:
+        return None
+
+    from mcp import types
+
+    async def list_roots(context=None):
+        roots = []
+        for raw in _ROOTS:
+            uri = raw if "://" in raw else Path(raw).expanduser().resolve().as_uri()
+            roots.append(types.Root(uri=uri, name=Path(raw).name or uri))
+        return types.ListRootsResult(roots=roots)
+
+    return list_roots
+
+
+def _logging_callback():
+    """Print server log notifications to stderr when the user asked for them."""
+    if not _LOG_LEVEL and not os.environ.get("MCP2CLI_DEBUG"):
+        return None
+
+    async def on_log(params):
+        level = getattr(params, "level", "info")
+        data = getattr(params, "data", params)
+        logger = getattr(params, "logger", None)
+        prefix = f"[server:{logger}]" if logger else "[server]"
+        print(f"{prefix} {level}: {data}", file=sys.stderr)
+
+    return on_log
+
+
+async def _decline_sampling(context, params):
+    """Refuse ``sampling/createMessage`` with an explanation, not a bare error.
+
+    mcp2cli is a CLI with no model behind it. Declining clearly beats the
+    SDK's default "method not found", which leaves the user guessing why a
+    tool failed.
+    """
+    from mcp import types
+
+    return types.ErrorData(
+        code=types.INVALID_REQUEST,
+        message=(
+            "mcp2cli cannot service sampling/createMessage: it is a CLI with no "
+            "model attached. Use this tool from an MCP host that supports sampling."
+        ),
+    )
+
+
+async def _decline_elicitation(context, params):
+    """Refuse ``elicitation/create`` with an explanation."""
+    from mcp import types
+
+    return types.ErrorData(
+        code=types.INVALID_REQUEST,
+        message=(
+            "mcp2cli cannot service elicitation/create: it runs non-interactively. "
+            "Supply the value up front as a tool argument instead."
+        ),
+    )
+
+
 def _client_session(read, write):
-    """Build a ClientSession with mcp2cli's identity and timeout."""
+    """Build a ClientSession with mcp2cli's identity, timeout and capabilities."""
     from mcp import ClientSession
 
     return ClientSession(
@@ -3622,7 +3795,51 @@ def _client_session(read, write):
         write,
         read_timeout_seconds=_TIMEOUT,
         client_info=_mcp_client_info(),
+        list_roots_callback=_roots_callback(),
+        logging_callback=_logging_callback(),
+        sampling_callback=_decline_sampling,
+        elicitation_callback=_decline_elicitation,
     )
+
+
+async def _initialize(session):
+    """Handshake, then apply any client-side settings that need a live session."""
+    result = await session.initialize()
+    await _apply_log_level(session)
+    return result
+
+
+async def _apply_log_level(session) -> None:
+    """Ask the server to emit logs at --log-level, if it supports logging."""
+    if not _LOG_LEVEL:
+        return
+    try:
+        import warnings
+
+        with warnings.catch_warnings():
+            # The SDK deprecates the logging capability as of 2026-07-28, but
+            # servers in the field still implement it and the user asked for it.
+            warnings.simplefilter("ignore")
+            await session.set_logging_level(_LOG_LEVEL)
+    except Exception as exc:  # noqa: BLE001 - logging is best-effort
+        print(
+            f"[mcp2cli] server did not accept --log-level {_LOG_LEVEL} "
+            f"({_exc_message(exc)})",
+            file=sys.stderr,
+        )
+
+
+def _progress_callback():
+    """Report tool progress on stderr when the user asked for logs."""
+    if not _LOG_LEVEL and not os.environ.get("MCP2CLI_DEBUG"):
+        return None
+
+    async def on_progress(progress: float, total: float | None, message: str | None):
+        pct = f"{progress}/{total}" if total else f"{progress}"
+        suffix = f" {message}" if message else ""
+        print(f"[progress] {pct}{suffix}", file=sys.stderr)
+
+    return on_progress
 
 
 def _http_timeout():
@@ -3864,7 +4081,12 @@ async def _call_tool_robust(session, tool_name: str, arguments: dict | None):
     """Call a tool, surviving a result the MCP schema rejects."""
 
     async def strict():
-        return await session.call_tool(tool_name, arguments or {})
+        callback = _progress_callback()
+        if callback is None:
+            return await session.call_tool(tool_name, arguments or {})
+        return await session.call_tool(
+            tool_name, arguments or {}, progress_callback=callback
+        )
 
     async def lenient():
         return _RawToolResult(
@@ -4051,7 +4273,7 @@ def _run_session_daemon(config_json: str):
 
     async def _daemon():
         async def _run_with_session(session):
-            await session.initialize()
+            await _initialize(session)
 
             # Write metadata
             meta = {
@@ -4267,6 +4489,7 @@ def handle_mcp(
     prompt_action: str | None = None,
     prompt_name: str | None = None,
     prompt_arguments: dict | None = None,
+    complete_spec: str | None = None,
     search_pattern: str | None = None,
     bake_config: BakeConfig | None = None,
     head: int | None = None,
@@ -4288,14 +4511,15 @@ def handle_mcp(
     key = cache_key_override or cache_key_for(config_for_cache)
     src_hash = _source_hash_for(source)
 
-    # Resource/prompt operations skip the tool flow entirely
-    if resource_action or prompt_action:
+    # Resource/prompt/completion operations skip the tool flow entirely
+    if resource_action or prompt_action or complete_spec:
         extra = dict(
             resource_action=resource_action,
             resource_uri=resource_uri,
             prompt_action=prompt_action,
             prompt_name=prompt_name,
             prompt_arguments=prompt_arguments,
+            complete_spec=complete_spec,
             head=head,
             json_output=json_output,
         )
@@ -4394,7 +4618,7 @@ def _fetch_mcp_tools(
     tools_result: list[dict] = []
 
     async def _work(session):
-        await session.initialize()
+        await _initialize(session)
         tools_result.extend(await _fetch_tool_dicts(session))
 
     async def _run():
@@ -4459,6 +4683,7 @@ def _split_at_subcommand(
 
 def main():
     try:
+        _quiet_sdk_logging()
         _dispatch_main(sys.argv[1:])
     except SystemExit:
         raise
@@ -4474,14 +4699,41 @@ def main():
         sys.exit(1)
 
 
+def _quiet_sdk_logging() -> None:
+    """Silence SDK-internal warnings that are noise for a one-shot CLI.
+
+    The SDK warns "Tool X not listed by server, cannot validate any structured
+    content" whenever it calls a tool it has not seen in a ``tools/list`` on
+    that same session — which is every call mcp2cli makes, because skipping the
+    re-list is the entire token-saving point, and because a paginating server
+    only puts page one in the SDK's validation cache. ``MCP2CLI_DEBUG=1``
+    restores the SDK's own logging.
+    """
+    if os.environ.get("MCP2CLI_DEBUG"):
+        return
+    import logging
+
+    # The SDK's client logger is named "client" (mcp/client/session.py).
+    for name in ("client", "mcp", "mcp.client.session"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+
 def _dispatch_main(argv: list[str]) -> None:
-    if argv:
-        first = argv[0]
+    """Route to bake / a baked tool / the normal flow.
+
+    The ``bake`` and ``@name`` tokens are recognised at the first *positional*
+    slot rather than strictly at argv[0], so global flags may precede them
+    (``mcp2cli --json @petstore --list``). Reusing the argv splitter means an
+    option's value is never mistaken for the subcommand.
+    """
+    global_argv, rest = _split_at_subcommand(argv, _build_main_parser())
+    if rest:
+        first = rest[0]
         if first == "bake":
-            _handle_bake(argv[1:])
+            _handle_bake(rest[1:])
             return
         if first.startswith("@"):
-            _run_baked(first[1:], argv[1:])
+            _run_baked(first[1:], global_argv + rest[1:])
             return
     _main_impl(argv)
 
@@ -4615,6 +4867,38 @@ def _build_main_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Environment variable KEY=VALUE for MCP stdio (repeatable)",
+    )
+    pre.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        metavar="PATH|URI",
+        help=(
+            "Expose a filesystem root to the server (repeatable). Servers that "
+            "scope themselves to a workspace ask for these via roots/list."
+        ),
+    )
+    pre.add_argument(
+        "--log-level",
+        default=None,
+        choices=[
+            "debug", "info", "notice", "warning",
+            "error", "critical", "alert", "emergency",
+        ],
+        help=(
+            "Ask the server to emit log notifications at this level and print "
+            "them (with tool progress) on stderr."
+        ),
+    )
+    pre.add_argument(
+        "--complete",
+        default=None,
+        metavar="REF:ARG=PREFIX",
+        help=(
+            "Ask the server to complete an argument value, e.g. "
+            "--complete 'my-prompt:city=San'. REF is a prompt name, or a "
+            "resource URI template when it contains '://'."
+        ),
     )
     pre.add_argument(
         "--oauth",
@@ -5067,7 +5351,7 @@ def _handle_openapi_mode(
 
 
 def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
-    global _TIMEOUT
+    global _TIMEOUT, _LOG_LEVEL
     pre = _build_main_parser()
 
     # Split argv at the subcommand boundary so that tool parameters whose
@@ -5079,6 +5363,10 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
 
     if pre_args.timeout is not None and pre_args.timeout > 0:
         _TIMEOUT = pre_args.timeout
+    if pre_args.root:
+        _ROOTS[:] = pre_args.root
+    if pre_args.log_level:
+        _LOG_LEVEL = pre_args.log_level
 
     # --search implies --list
     search_pattern = pre_args.search_pattern
@@ -5151,6 +5439,7 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
             prompt_action=prompt_action,
             prompt_name=prompt_name,
             prompt_arguments=prompt_arguments,
+            complete_spec=pre_args.complete,
             search_pattern=search_pattern,
             bake_config=bake_config,
             head=pre_args.head,

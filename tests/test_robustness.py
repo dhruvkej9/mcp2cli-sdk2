@@ -7,6 +7,7 @@ normalisation stands between the test and the wire format.
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -450,6 +451,108 @@ class TestClientIdentity:
     def test_client_info_helper(self):
         info = mcp2cli._mcp_client_info()
         assert info is not None and info.name == "mcp2cli"
+
+
+class TestClientCapabilities:
+    """Server→client requests: roots, sampling, elicitation, progress.
+
+    A server that asks the client for something must get a usable answer or a
+    clear refusal — never a silent hang or an opaque "method not found".
+    """
+
+    def test_roots_are_offered_when_given(self):
+        r = run_cli("--root", "/tmp", "--root", "/var", "roots-probe")
+        assert r.returncode == 0, r.stderr
+        roots = json.loads(r.stdout)
+        assert {root["uri"] for root in roots} == {"file:///tmp", "file:///var"}
+
+    def test_no_roots_declared_without_the_flag(self):
+        r = run_cli("roots-probe")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == []
+
+    def test_root_accepts_a_uri(self):
+        r = run_cli("--root", "file:///srv/project", "roots-probe")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout)[0]["uri"] == "file:///srv/project"
+
+    def test_relative_root_is_resolved_to_an_absolute_uri(self):
+        r = run_cli("--root", ".", "roots-probe")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout)[0]["uri"].startswith("file:///")
+
+    def test_sampling_is_refused_with_an_explanation(self):
+        r = run_cli("sampling-probe")
+        assert r.returncode == 0, r.stderr
+        payload = json.loads(r.stdout)
+        assert payload["refused"] is True
+        assert "sampling" in payload["message"].lower()
+
+    def test_elicitation_is_refused(self):
+        r = run_cli("elicit-probe")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout)["refused"] is True
+
+    def test_progress_notifications_are_shown_with_log_level(self):
+        r = run_cli("--log-level", "info", "progress-probe")
+        assert r.returncode == 0, r.stderr
+        assert "[progress] 1.0/3.0" in r.stderr
+        assert "progress done" in r.stdout
+
+    def test_progress_is_silent_by_default(self):
+        r = run_cli("progress-probe")
+        assert r.returncode == 0, r.stderr
+        assert "[progress]" not in r.stderr
+
+    def test_server_logs_are_shown_with_log_level(self):
+        r = run_cli("--log-level", "debug", "get-user", "--id", "1")
+        assert r.returncode == 0, r.stderr
+        assert "log level accepted" in r.stderr
+
+    def test_server_logs_are_silent_by_default(self):
+        r = run_cli("get-user", "--id", "1")
+        assert r.returncode == 0, r.stderr
+        assert "log level accepted" not in r.stderr
+
+    def test_sdk_validation_warnings_are_suppressed(self):
+        """The SDK warns on every call we make; it is noise, not news."""
+        r = run_cli("roots-probe")
+        assert "not listed by server" not in r.stderr
+
+    def test_sdk_warnings_return_under_debug(self):
+        env = {**os.environ, "MCP2CLI_DEBUG": "1"}
+        r = run_cli("roots-probe", env=env)
+        assert "not listed by server" in r.stderr
+
+
+class TestCompletion:
+    """completion/complete — argument autocompletion."""
+
+    def test_prompt_argument_completion(self):
+        r = run_cli("--complete", "first_prompt:topic=Eng")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout)["values"] == ["Engineering"]
+
+    def test_empty_prefix_returns_everything(self):
+        r = run_cli("--complete", "first_prompt:topic=")
+        assert r.returncode == 0, r.stderr
+        assert len(json.loads(r.stdout)["values"]) == 4
+
+    def test_resource_template_completion(self):
+        r = run_cli("--complete", "hostile://doc/{name}:name=S")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout)["values"] == ["Sales", "Support"]
+
+    def test_malformed_spec_is_rejected(self):
+        r = run_cli("--complete", "no-separator-here")
+        assert r.returncode == 1
+        assert "REF:ARG=PREFIX" in r.stderr
+
+    def test_spec_parser(self):
+        assert mcp2cli.parse_complete_spec("p:city=San") == ("p", "city", "San")
+        assert mcp2cli.parse_complete_spec("hostile://doc/{n}:n=") == (
+            "hostile://doc/{n}", "n", "",
+        )
 
 
 class TestSchemaHelpers:

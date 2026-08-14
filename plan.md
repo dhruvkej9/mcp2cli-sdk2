@@ -25,7 +25,10 @@ purpose-built "hostile but protocol-legal" server:
 | `@modelcontextprotocol/server-sequential-thinking` | stdio |
 | `mcp-server-time`, `mcp-server-git` pinned to `mcp==1.9.0` | stdio — genuine **MCP 1.x** servers with pydantic schemas |
 | `@playwright/mcp` | stdio — a large third-party server (24 tools) |
-| `mcp.context7.com/mcp`, `mcp.deepwiki.com/mcp` | hosted production servers over streamable HTTP |
+| `@ui5/mcp-server` (SAP UI5) | stdio — enum-constrained params |
+| `@cap-js/mcp-server` (SAP CAP CDS), `cds-mcp` | stdio |
+| `exa-mcp-server` | stdio **and** hosted streamable HTTP — same tools both ways |
+| `mcp.context7.com/mcp`, `mcp.deepwiki.com/mcp`, `mcp.exa.ai/mcp` | hosted production servers over streamable HTTP |
 | `tests/hostile_server.py` | raw JSON-RPC, every awkward-but-legal shape |
 
 Two servers (`mcp-server-time`, `mcp-server-git` unpinned) fail on their own
@@ -146,6 +149,68 @@ to a version that starts.
   - `--compact`, `--top`, `--sort` and `--head` were silently ignored in
     session mode — exactly the flags that keep agent token cost down.
 
+## Round two — authentication and the full protocol surface
+
+Driven by two follow-ups: "servers with authentication, and mostly tool calling
+fails", and "check the MCP docs — every type of MCP should work".
+
+- [x] **23. Authenticated servers, end to end.** Listing and calling are
+  different requests, and over SSE they are different *endpoints*, so a client
+  that credentials only the handshake lists fine and fails every call.
+  `tests/auth_mcp_server.py` enforces a bearer token in ASGI middleware ahead of
+  the MCP app — nothing escapes it — and every test that lists also calls.
+  Verified across streamable HTTP, SSE, `env:`/`file:` secrets, custom header
+  names, baked configs and session daemons.
+- [x] **24. Auth failures now name themselves.** The SDK collapses a 401 into
+  `MCPError(-32603, "Server returned an error response")`. mcp2cli probes the
+  endpoint and reports `authentication failed (HTTP 401) … pass credentials
+  with --auth-header`, for pinned transports as well as `auto`.
+- [x] **25. ABAP FS-style server** (`marcellourbani/vscode_abap_remote_fs`),
+  mocked faithfully in `tests/abapfs_mock_server.py`: a **stateful**
+  `Mcp-Session-Id` lifecycle (drop the header and everything after initialize
+  400s), `Authorization` accepted as `Bearer <key>` *or* bare, a JSON-RPC error
+  body on 401, and real SAP tool schemas (enum arrays, numeric defaults).
+- [x] **26. Whole numbers are sent as integers.** A `"type": "number"` field
+  was sent as `5.0`; servers that declare `number` but validate with `zod.int()`
+  reject that. Fractional values are untouched.
+- [x] **27. `roots/list` is answered** from a new `--root PATH|URI` (repeatable).
+  The filesystem server previously logged "Client does not support MCP Roots";
+  it now reports "Updated allowed directories from MCP roots".
+- [x] **28. `sampling/createMessage` and `elicitation/create` are declined with
+  a reason** instead of a bare "method not found", so a tool that needs a model
+  says so.
+- [x] **29. `--log-level`** asks the server for logs and prints them, plus tool
+  **progress notifications**, on stderr. Silent by default.
+- [x] **30. `completion/complete`** exposed as `--complete REF:ARG=PREFIX` for
+  prompt and resource-template arguments.
+- [x] **31. SDK noise suppressed.** "Tool X not listed by server, cannot
+  validate any structured content" fired on every call (mcp2cli deliberately
+  does not re-list before calling — that is the token saving). `MCP2CLI_DEBUG=1`
+  brings it back.
+- [x] **32. Global flags may precede a baked tool** — `mcp2cli --json @tool …`
+  used to fail with "one of --spec … is required".
+- [x] **33. `requirements.txt` / `requirements-dev.txt`** generated from
+  `uv.lock`, for environments that do not use uv.
+
+### Protocol coverage against the spec
+
+Checked against the method tables in the MCP spec (2024-11-05 → 2026-07-28):
+
+| Method | Status |
+| --- | --- |
+| `initialize`, `ping` | ✅ (all five protocol versions; verified against a real MCP 1.x server) |
+| `tools/list`, `tools/call` | ✅ paginated, lenient, every content-block kind |
+| `resources/list`, `resources/read`, `resources/templates/list` | ✅ paginated, lenient |
+| `prompts/list`, `prompts/get` | ✅ paginated, lenient, embedded resources |
+| `completion/complete` | ✅ `--complete` |
+| `logging/setLevel` + `notifications/message` | ✅ `--log-level` |
+| `notifications/progress` | ✅ shown with `--log-level` |
+| `roots/list` | ✅ `--root` |
+| `sampling/createMessage`, `elicitation/create` | ✅ declined with an explanation (a CLI has no model and no interactive prompt) |
+| `resources/subscribe` / `unsubscribe`, `notifications/*/list_changed` | ⛔ a one-shot CLI has nothing to do with a change stream; the session daemon is where this would belong |
+| `tasks/*` (2025-11-25) | ⛔ no client API in `mcp` 2.0.0; reported clearly |
+| `server/discover`, `subscriptions/listen` (2026-07-28) | handled by the SDK |
+
 ---
 
 ## Testing overhaul
@@ -162,9 +227,15 @@ to a version that starts.
 - [x] `tests/test_sessions.py` — 19 tests proving the persistent session daemon
   behaves identically to a direct connection (pagination, content blocks, clean
   errors, list shaping) plus the socket-path length fallback.
+- [x] `tests/auth_mcp_server.py` + `tests/test_auth.py` — 29 tests over an
+  ASGI-authenticated MCP server: streamable HTTP and SSE, tool calls (not just
+  listing), credential sources, rejections, baked configs and session daemons.
+- [x] `tests/abapfs_mock_server.py` + `tests/test_abapfs_server.py` — 23 tests
+  against an ABAP FS-style stateful session server with bare-token auth.
 - [x] `tests/test_real_servers.py` — opt-in integration suite against the real
-  everything / filesystem / memory / playwright / git servers over stdio,
-  streamable HTTP and SSE, plus a genuine MCP 1.x server and a bake round-trip. Skipped unless
+  everything / filesystem / memory / playwright / git / UI5 / CAP-CDS / Exa
+  servers over stdio, streamable HTTP and SSE, plus a genuine MCP 1.x server
+  and a bake round-trip. Skipped unless
   `MCP2CLI_TEST_REAL=1`, so the default suite stays hermetic.
 - [x] `pyproject.toml` — registered markers (`real`, `slow`),
   `--strict-markers`, `asyncio_mode`, `testpaths`.
