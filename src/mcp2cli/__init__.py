@@ -2803,6 +2803,44 @@ def execute_openapi(
 # ---------------------------------------------------------------------------
 
 
+def _exc_message(exc: BaseException) -> str:
+    """Flatten an exception — incl. anyio ExceptionGroups — into one message."""
+    nested = getattr(exc, "exceptions", None)
+    if nested:
+        parts = [_exc_message(e) for e in nested]
+        return "; ".join(p for p in parts if p) or exc.__class__.__name__
+    return str(exc) or exc.__class__.__name__
+
+
+def _run_mcp_clean(fn, source: str):
+    """Run an MCP coroutine, reporting failures as one clean error line.
+
+    Transport failures (bad URL, refused connection, 401/403) otherwise reach
+    the terminal as a multi-level anyio ExceptionGroup traceback with the
+    actual cause buried at the bottom. Set MCP2CLI_DEBUG=1 for the traceback.
+    """
+    try:
+        return anyio.run(fn)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:  # pragma: no cover - interactive only
+        raise
+    except BaseException as exc:
+        if os.environ.get("MCP2CLI_DEBUG"):
+            raise
+        message = _exc_message(exc)
+        lowered = message.lower()
+        if "401" in lowered or "403" in lowered:
+            hint = (
+                " — the server rejected the request; pass credentials with "
+                "--auth-header 'Name:Value' or use the --oauth-* options"
+            )
+        else:
+            hint = ""
+        print(f"Error: cannot use MCP server at {source}: {message}{hint}", file=sys.stderr)
+        sys.exit(1)
+
+
 def run_mcp_http(
     url: str,
     auth_headers: list[tuple[str, str]],
@@ -2905,7 +2943,7 @@ def run_mcp_http(
             except Exception:
                 return await _with_sse()
 
-    rc = anyio.run(_run)
+    rc = _run_mcp_clean(_run, url)
     if rc:
         sys.exit(rc)
 
@@ -2979,7 +3017,7 @@ def run_mcp_stdio(
                     **extra,
                 )
 
-    rc = anyio.run(_run)
+    rc = _run_mcp_clean(_run, command_str)
     if rc:
         sys.exit(rc)
 
@@ -3928,7 +3966,7 @@ def _fetch_mcp_tools(
                 except Exception:
                     await _via_sse()
 
-    anyio.run(_run)
+    _run_mcp_clean(_run, source)
     return tools_result
 
 

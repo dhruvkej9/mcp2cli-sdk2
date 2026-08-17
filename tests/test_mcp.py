@@ -442,6 +442,7 @@ class TestSessions:
             text=True,
             timeout=30,
         )
+
         assert r.returncode == 0
 
         try:
@@ -480,4 +481,70 @@ class TestSessions:
                 text=True,
                 timeout=10,
             )
+class TestConnectionErrors:
+    """Transport failures must report one clean error line, not a traceback."""
 
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, "-m", "mcp2cli", *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+
+    def test_unreachable_server_is_one_clean_line(self):
+        r = self._run(
+            "--mcp", "http://127.0.0.1:9/mcp", "--list", "--transport", "streamable"
+        )
+        assert r.returncode != 0
+        assert "Traceback" not in r.stderr
+        assert "Error: cannot use MCP server at http://127.0.0.1:9/mcp" in r.stderr
+        assert r.stdout == ""
+
+    def test_auth_rejection_hints_at_credentials(self):
+        """A 401/403 should suggest --auth-header instead of dumping a traceback."""
+        import http.server
+        import threading
+
+        class Deny(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(401)
+                self.end_headers()
+
+            def do_POST(self):
+                self.send_response(401)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Deny)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = self._run("--mcp", f"http://127.0.0.1:{port}/mcp", "--list")
+            assert r.returncode != 0
+            assert "Traceback" not in r.stderr
+            assert "--auth-header" in r.stderr
+        finally:
+            server.shutdown()
+
+    def test_debug_env_restores_traceback(self):
+        import os
+
+        env = {**os.environ, "MCP2CLI_DEBUG": "1"}
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "mcp2cli",
+                "--mcp", "http://127.0.0.1:9/mcp", "--list",
+                "--transport", "streamable",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        assert r.returncode != 0
+        assert "Traceback" in r.stderr
