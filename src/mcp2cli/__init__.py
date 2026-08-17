@@ -2905,7 +2905,9 @@ def run_mcp_http(
             except Exception:
                 return await _with_sse()
 
-    anyio.run(_run)
+    rc = anyio.run(_run)
+    if rc:
+        sys.exit(rc)
 
 
 def run_mcp_stdio(
@@ -2963,7 +2965,7 @@ def run_mcp_stdio(
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                await _mcp_session(
+                return await _mcp_session(
                     session,
                     tool_name,
                     arguments,
@@ -2977,7 +2979,9 @@ def run_mcp_stdio(
                     **extra,
                 )
 
-    anyio.run(_run)
+    rc = anyio.run(_run)
+    if rc:
+        sys.exit(rc)
 
 
 async def _mcp_session(
@@ -3068,10 +3072,20 @@ async def _mcp_session(
         # isError) with the camelCase wire names, so the envelope does not
         # change shape with the installed SDK major.
         output_result(_mcp_dump(result), pretty=pretty, head=head, json_output=True)
-        return
+        # A failed tool still exits non-zero under --json so callers can detect
+        # it; the envelope on stdout already carries isError for machines.
+        return 1 if _mcp_attr(result, "isError") else 0
 
     text = _extract_content_parts(result.content)
+    if _mcp_attr(result, "isError"):
+        # isError is the MCP signal that the tool failed: report on stderr and
+        # exit non-zero so shell pipelines and CI can detect the failure.
+        # Return the code instead of sys.exit() — a SystemExit raised inside
+        # the anyio task group resurfaces as a BaseExceptionGroup traceback.
+        print(f"Error: {text or f'tool {tool_name!r} reported an error'}", file=sys.stderr)
+        return 1
     output_result(text, pretty=pretty, raw=raw, toon=toon, head=head)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -3370,7 +3384,10 @@ async def _dispatch_list_tools(session, params):
 
 async def _dispatch_call_tool(session, params):
     result = await session.call_tool(params["name"], params.get("arguments", {}))
-    return _extract_content_parts(result.content)
+    return {
+        "content": _extract_content_parts(result.content),
+        "isError": bool(_mcp_attr(result, "isError")),
+    }
 
 
 async def _dispatch_list_resources(session, params):
@@ -4428,6 +4445,16 @@ def _handle_session_operations(
     result = _session_request(
         sess_name, "call_tool", {"name": cmd.tool_name, "arguments": arguments}
     )
+    if isinstance(result, dict) and "isError" in result:
+        # The daemon reports the tool's isError flag; surface it like the
+        # direct path does: stderr + non-zero exit.
+        if result.get("isError"):
+            print(
+                f"Error: {result.get('content') or f'tool {cmd.tool_name!r} reported an error'}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        result = result["content"]
     output_result(result, **_sess_out)
     return True
 

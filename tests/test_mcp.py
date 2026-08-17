@@ -168,6 +168,23 @@ class TestMCPStdio:
         r2 = self._run("echo", "--message", "second")
         assert r2.returncode == 0
 
+    # --- Tool failures (isError) ---
+
+    def test_iserror_tool_exits_nonzero(self):
+        """A tool result with isError=true must exit non-zero, on stderr."""
+        r = self._run("fail")
+        assert r.returncode != 0
+        assert "boom: deliberate failure" in r.stderr
+        assert "boom: deliberate failure" not in r.stdout
+
+    def test_iserror_tool_json_keeps_envelope_but_exits_nonzero(self):
+        """--json still emits the full envelope, but the exit code reflects failure."""
+        r = self._run("--json", "fail")
+        assert r.returncode != 0
+        envelope = json.loads(r.stdout)
+        assert envelope["isError"] is True
+        assert envelope["content"][0]["text"] == "boom: deliberate failure"
+
     # --- Resources ---
 
     def test_list_resources(self):
@@ -405,4 +422,62 @@ class TestSessions:
             timeout=10,
         )
         assert name not in r.stdout or "dead" in r.stdout
+
+    def test_session_iserror_tool_exits_nonzero(self):
+        """isError through the session daemon must also exit non-zero."""
+        server = f"{sys.executable} {MCP_SERVER}"
+        name = "test-iserror"
+
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mcp2cli",
+                "--mcp-stdio",
+                server,
+                "--session-start",
+                name,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert r.returncode == 0
+
+        try:
+            r = subprocess.run(
+                [sys.executable, "-m", "mcp2cli", "--session", name, "fail"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert r.returncode != 0
+            assert "boom: deliberate failure" in r.stderr
+            assert "boom: deliberate failure" not in r.stdout
+
+            # Successful calls still print to stdout and exit 0.
+            r = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp2cli",
+                    "--session",
+                    name,
+                    "echo",
+                    "--message",
+                    "still fine",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert r.returncode == 0
+            assert "still fine" in r.stdout
+        finally:
+            subprocess.run(
+                [sys.executable, "-m", "mcp2cli", "--session-stop", name],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
 
