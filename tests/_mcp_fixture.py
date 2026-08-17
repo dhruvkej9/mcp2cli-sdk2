@@ -72,6 +72,11 @@ TOOLS = [
             "required": ["env"],
         },
     },
+    {
+        "name": "fail",
+        "description": "Always fails with isError (for exit-code tests)",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 RESOURCES = [
@@ -151,6 +156,8 @@ def _call_tool(name: str, arguments: dict) -> dict:
             "refresh": arguments.get("refresh", False),
         }
         return {"content": [_text(json.dumps(payload))], "isError": False}
+    if name == "fail":
+        return {"content": [_text("boom: deliberate failure")], "isError": True}
     return {"content": [_text(f"Unknown tool: {name}")], "isError": True}
 
 
