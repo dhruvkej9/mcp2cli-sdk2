@@ -1934,7 +1934,7 @@ def _build_graphql_document(
     types_by_name = {t["name"]: t for t in schema.get("types", []) if t.get("name")}
 
     # Build variables dict from args
-    if getattr(args, "stdin", False):
+    if getattr(args, "stdin", False) is True:
         variables = read_stdin_json("GraphQL variables")
     else:
         variables = {}
@@ -2486,6 +2486,14 @@ def build_argparse(
         seen_flags: set[str] = set()
         for p in cmd.params:
             flag = f"--{p.name}"
+            # argparse owns --help on every subparser and mcp2cli owns --stdin;
+            # a tool property with one of these names raised "conflicting option
+            # string" while building the parser, which killed *every* command on
+            # that server, not just the offending tool. Rename the flag but pin
+            # dest so argument collection (getattr(args, p.name)) still finds it.
+            renamed = p.name in ("help", "stdin")
+            if renamed:
+                flag = f"--arg-{p.name}"
             if flag in seen_flags:
                 continue  # skip duplicate param names (e.g. path + body both have same name)
             seen_flags.add(flag)
@@ -2506,6 +2514,8 @@ def build_argparse(
             kwargs["help"] = escape_argparse_help(p.description)
             if p.choices:
                 kwargs["choices"] = p.choices
+            if renamed:
+                kwargs["dest"] = p.name.replace("-", "_")
             sub.add_argument(flag, **kwargs)
 
     return parser
@@ -2648,7 +2658,7 @@ def _collect_openapi_params(
             elif p.location == "header":
                 extra_headers[p.original_name] = str(val)
     else:
-        if getattr(args, "stdin", False):
+        if getattr(args, "stdin", False) is True:
             body = read_stdin_json("OpenAPI request body")
         else:
             body = {}
@@ -3772,7 +3782,7 @@ def handle_mcp(
 
     cmd: CommandDef = args._cmd
 
-    if getattr(args, "stdin", False):
+    if getattr(args, "stdin", False) is True:
         arguments = read_stdin_json("MCP tool arguments")
     else:
         arguments = {}
@@ -4366,7 +4376,7 @@ def _handle_session_operations(
         sys.exit(1)
 
     cmd: CommandDef = args._cmd
-    if getattr(args, "stdin", False):
+    if getattr(args, "stdin", False) is True:
         arguments = read_stdin_json(f"session {sess_name} tool arguments")
     else:
         arguments = {}

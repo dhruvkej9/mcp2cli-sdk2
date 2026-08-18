@@ -426,6 +426,37 @@ class TestExtractMCPCommands:
         assert cmds[0].tool_name == "list_items"
 
 
+class TestBuildArgparseReservedFlags:
+    """A tool property named help/stdin used to raise 'conflicting option
+    string' during parser build, killing every command on that server."""
+
+    def _build(self, props):
+        from mcp2cli import build_argparse
+
+        tools = [
+            {
+                "name": "weird",
+                "description": "reserved props",
+                "inputSchema": {"type": "object", "properties": props},
+            }
+        ]
+        pre = argparse.ArgumentParser(add_help=False)
+        return build_argparse(extract_mcp_commands(tools), pre)
+
+    def test_help_property_does_not_brick_parser(self):
+        parser = self._build({"help": {"type": "string"}})
+        args = parser.parse_args(["weird", "--arg-help", "h1"])
+        assert args.help == "h1"
+
+    def test_stdin_property_does_not_brick_parser_or_trigger_stdin_mode(self):
+        parser = self._build({"stdin": {"type": "string"}})
+        args = parser.parse_args(["weird", "--arg-stdin", "s1"])
+        assert args.stdin == "s1"  # value, not True -> stdin mode not triggered
+        # built-in --stdin still works
+        args2 = parser.parse_args(["weird", "--stdin"])
+        assert args2.stdin is True
+
+
 class TestSplitAtSubcommand:
     """Tests for _split_at_subcommand() — GH #15."""
 
