@@ -3031,6 +3031,13 @@ async def _mcp_session(
         return
 
     text = _extract_content_parts(result.content)
+    if not text:
+        # A tool may return only structuredContent with an empty content list;
+        # without this fallback the call prints nothing at all.
+        structured = _mcp_attr(result, "structuredContent")
+        if structured is not None:
+            output_result(structured, pretty=pretty, raw=raw, toon=toon, head=head)
+            return
     output_result(text, pretty=pretty, raw=raw, toon=toon, head=head)
 
 

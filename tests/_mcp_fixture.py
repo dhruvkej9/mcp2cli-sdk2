@@ -72,6 +72,11 @@ TOOLS = [
             "required": ["env"],
         },
     },
+    {
+        "name": "struct_only",
+        "description": "Returns only structuredContent (empty content list)",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 RESOURCES = [
@@ -151,6 +156,12 @@ def _call_tool(name: str, arguments: dict) -> dict:
             "refresh": arguments.get("refresh", False),
         }
         return {"content": [_text(json.dumps(payload))], "isError": False}
+    if name == "struct_only":
+        return {
+            "content": [],
+            "structuredContent": {"answer": 42},
+            "isError": False,
+        }
     return {"content": [_text(f"Unknown tool: {name}")], "isError": True}
 
 

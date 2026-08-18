@@ -65,6 +65,16 @@ class TestMCPStdio:
         data = json.loads(r.stdout)
         assert data["recursive"] is True
 
+    def test_structured_content_only(self):
+        """A tool returning only structuredContent (empty content list) must
+        still print the payload instead of printing nothing."""
+        # --refresh: the tool list is cached on disk by server command; force a
+        # re-fetch so this test doesn't depend on cache freshness.
+        r = self._run("--refresh", "struct-only")
+        assert r.returncode == 0
+        data = json.loads(r.stdout)
+        assert data == {"answer": 42}
+
     def test_echo_stdin(self):
         r = self._run("echo", "--stdin", stdin_data='{"message": "from stdin"}')
         assert r.returncode == 0
