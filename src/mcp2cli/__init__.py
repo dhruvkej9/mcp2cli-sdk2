@@ -3280,13 +3280,23 @@ def session_start(
 
 
 def _extract_content_parts(content_list, *, attrs=("text", "data")) -> str:
-    """Extract text/data/blob from MCP content objects, joined by newline."""
+    """Extract text/data/blob from MCP content objects, joined by newline.
+
+    ``resource_link`` blocks carry neither ``text`` nor ``data`` — only
+    ``uri``/``name`` — so they used to be dropped silently. Render them as
+    ``name: uri`` (or just the URI) instead.
+    """
     parts = []
     for c in content_list:
         for attr in attrs:
             if hasattr(c, attr):
                 parts.append(getattr(c, attr))
                 break
+        else:
+            uri = getattr(c, "uri", None)
+            if uri is not None:
+                name = getattr(c, "name", None)
+                parts.append(f"{name}: {uri}" if name else str(uri))
     return "\n".join(parts) if parts else ""
 
 
