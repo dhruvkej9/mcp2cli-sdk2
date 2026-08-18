@@ -59,6 +59,20 @@ class TestSchemaTypeToPython:
         assert schema_type_to_python({"type": ["integer", "null"]}) == (int, "")
         assert schema_type_to_python({"type": ["number", "null"]}) == (float, "")
         assert schema_type_to_python({"type": ["string", "null"]}) == (str, "")
+    def test_missing_type_int_enum_inferred(self):
+        # No "type" but a numeric enum: argparse must parse the flag as int or
+        # it rejects the value against numeric choices.
+        assert schema_type_to_python({"enum": [1, 2, 3]}) == (int, "")
+
+    def test_missing_type_float_enum_inferred(self):
+        assert schema_type_to_python({"enum": [0.5, 1.5]}) == (float, "")
+
+    def test_missing_type_string_enum_stays_str(self):
+        assert schema_type_to_python({"enum": ["a", "b"]}) == (str, "")
+
+    def test_missing_type_bool_enum_not_inferred(self):
+        # bool is a subclass of int; don't misread a bool enum as int
+        assert schema_type_to_python({"enum": [True, False]}) == (str, "")
 
 
 class TestCoerceValue:

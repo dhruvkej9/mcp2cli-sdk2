@@ -199,6 +199,16 @@ def schema_type_to_python(schema: dict) -> tuple[type | None, str]:
         return str, " (JSON array)"
     if t == "object":
         return str, " (JSON object)"
+    if t is None:
+        # No "type" but an enum: infer the argparse type from the values, so
+        # numeric enums stay callable (otherwise argparse parses the flag as a
+        # string and rejects it against numeric choices).
+        enum = schema.get("enum")
+        if enum and not any(isinstance(v, bool) for v in enum):
+            if all(isinstance(v, int) for v in enum):
+                return int, ""
+            if all(isinstance(v, (int, float)) for v in enum):
+                return float, ""
     return str, ""
 
 
