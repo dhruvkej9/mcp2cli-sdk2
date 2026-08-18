@@ -426,6 +426,20 @@ class TestExtractMCPCommands:
         assert cmds[0].name == "list-items"
         assert cmds[0].tool_name == "list_items"
 
+    def test_kebab_collision_deduplicated(self):
+        """get_user + getUser both kebab to get-user; argparse would raise
+        'conflicting subparser' and brick the CLI. Names must be unique while
+        tool_name keeps the original wire name."""
+        tools = [
+            {"name": "get_user", "description": "snake", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "getUser", "description": "camel", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "get-user", "description": "kebab", "inputSchema": {"type": "object", "properties": {}}},
+        ]
+        cmds = extract_mcp_commands(tools)
+        names = [c.name for c in cmds]
+        assert len(set(names)) == 3
+        assert [c.tool_name for c in cmds] == ["get_user", "getUser", "get-user"]
+
 
 class TestSplitAtSubcommand:
     """Tests for _split_at_subcommand() — GH #15."""
