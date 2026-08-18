@@ -65,6 +65,33 @@ class TestMCPStdio:
         data = json.loads(r.stdout)
         assert data["recursive"] is True
 
+    def test_structured_content_only(self):
+        """A tool returning only structuredContent (empty content list) must
+        still print the payload instead of printing nothing."""
+        # --refresh: the tool list is cached on disk by server command; force a
+        # re-fetch so this test doesn't depend on cache freshness.
+        r = self._run("--refresh", "struct-only")
+        assert r.returncode == 0
+        data = json.loads(r.stdout)
+        assert data == {"answer": 42}
+
+    def test_reserved_boolean_stdin_property_reaches_tool(self):
+        r = self._run(
+            "--refresh",
+            "reserved-args",
+            "--arg-help",
+            "details",
+            "--arg-stdin-2",
+            "--arg-stdin",
+            "literal",
+        )
+        assert r.returncode == 0
+        assert json.loads(r.stdout) == {
+            "arg_stdin": "literal",
+            "help": "details",
+            "stdin": True,
+        }
+
     def test_echo_stdin(self):
         r = self._run("echo", "--stdin", stdin_data='{"message": "from stdin"}')
         assert r.returncode == 0
@@ -270,6 +297,16 @@ class TestMCPHTTP:
         assert r.returncode == 0
         assert "30" in r.stdout
 
+    def test_iserror_http_exits_nonzero(self, mcp_http_server):
+        plain = self._run(mcp_http_server, "fail")
+        assert plain.returncode != 0
+        assert "boom: deliberate failure" in plain.stderr
+        assert plain.stdout == ""
+
+        machine = self._run(mcp_http_server, "--json", "fail")
+        assert machine.returncode != 0
+        assert json.loads(machine.stdout)["isError"] is True
+
     # --- Resources (HTTP) ---
 
     def test_list_resources_http(self, mcp_http_server):
@@ -456,6 +493,39 @@ class TestSessions:
             assert "boom: deliberate failure" in r.stderr
             assert "boom: deliberate failure" not in r.stdout
 
+            machine = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp2cli",
+                    "--json",
+                    "--session",
+                    name,
+                    "fail",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert machine.returncode != 0
+            assert json.loads(machine.stdout)["isError"] is True
+
+            structured = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp2cli",
+                    "--session",
+                    name,
+                    "struct-only",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert structured.returncode == 0
+            assert json.loads(structured.stdout) == {"answer": 42}
+
             # Successful calls still print to stdout and exit 0.
             r = subprocess.run(
                 [
@@ -481,15 +551,20 @@ class TestSessions:
                 text=True,
                 timeout=10,
             )
+
 class TestConnectionErrors:
     """Transport failures must report one clean error line, not a traceback."""
 
     def _run(self, *args):
+        import os
+
+        env = {key: value for key, value in os.environ.items() if key != "MCP2CLI_DEBUG"}
         return subprocess.run(
             [sys.executable, "-m", "mcp2cli", *args],
             capture_output=True,
             text=True,
             timeout=30,
+            env=env,
         )
 
 
@@ -528,8 +603,22 @@ class TestConnectionErrors:
             assert r.returncode != 0
             assert "Traceback" not in r.stderr
             assert "--auth-header" in r.stderr
+            assert len(r.stderr.splitlines()) == 1
         finally:
             server.shutdown()
+
+    def test_grouped_system_exit_preserves_code(self):
+        import anyio
+
+        from mcp2cli import _run_mcp_clean
+
+        async def exit_inside_task_group():
+            async with anyio.create_task_group():
+                raise SystemExit(3)
+
+        with pytest.raises(SystemExit) as caught:
+            _run_mcp_clean(exit_inside_task_group, "test")
+        assert caught.value.code == 3
 
     def test_debug_env_restores_traceback(self):
         import os

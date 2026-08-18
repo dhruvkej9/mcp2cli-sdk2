@@ -61,6 +61,7 @@ class ParamDef:
     choices: list | None = None
     location: str = "body"  # path|query|header|body|tool_input
     schema: dict = field(default_factory=dict)
+    cli_name: str | None = None  # collision-free argparse flag name
 
 
 @dataclass
@@ -518,9 +519,34 @@ def _python_type_name(t: type | None) -> str:
     return getattr(t, "__name__", str(t))
 
 
+def _param_dest(p: "ParamDef") -> str:
+    """Return the argparse destination allocated for a parameter."""
+    return (p.cli_name or p.name).replace("-", "_")
+
+
+def _allocate_param_cli_names(cmd: "CommandDef") -> None:
+    """Assign unique parameter flags without shadowing built-in options."""
+    natural_names = {p.name for p in cmd.params}
+    used = {"help"}
+    if cmd.has_body:
+        used.add("stdin")
+
+    for p in cmd.params:
+        name = p.name
+        if name in used:
+            stem = f"arg-{name}"
+            name = stem
+            suffix = 2
+            while name in used or name in natural_names:
+                name = f"{stem}-{suffix}"
+                suffix += 1
+        p.cli_name = name
+        used.add(name)
+
+
 def _param_to_dict(p: "ParamDef") -> dict:
     d = {
-        "name": p.name,
+        "name": p.cli_name or p.name,
         "type": _python_type_name(p.python_type),
         "required": p.required,
         "description": p.description,
@@ -1513,19 +1539,34 @@ def extract_openapi_commands(spec: dict) -> list[CommandDef]:
 
 def extract_mcp_commands(tools: list[dict]) -> list[CommandDef]:
     commands: list[CommandDef] = []
+    base_names = [to_kebab(tool.get("name", "unknown")) for tool in tools]
+    reserved_names = set(base_names)
+    cli_names = [""] * len(tools)
     used_names: set[str] = set()
-    for tool in tools:
-        name = to_kebab(tool.get("name", "unknown"))
-        # Two tools can kebab-case to the same CLI name (get_user + getUser).
-        # argparse raises "conflicting subparser" and bricks the whole CLI, so
-        # de-duplicate here; the original name is still sent on the wire via
-        # tool_name.
-        if name in used_names:
-            suffix = 2
-            while f"{name}-{suffix}" in used_names:
-                suffix += 1
-            name = f"{name}-{suffix}"
-        used_names.add(name)
+    groups: dict[str, list[int]] = {}
+    for index, base_name in enumerate(base_names):
+        groups.setdefault(base_name, []).append(index)
+
+    # Assign aliases from the complete tool-name set so a generated suffix can
+    # never shadow another tool's natural name. Sorting each collision group by
+    # wire name keeps aliases stable when a server reorders tools/list.
+    for base_name in sorted(groups):
+        indices = sorted(
+            groups[base_name],
+            key=lambda index: (tools[index].get("name", "unknown"), index),
+        )
+        for rank, index in enumerate(indices):
+            name = base_name
+            if rank:
+                suffix = 2
+                name = f"{base_name}-{suffix}"
+                while name in reserved_names or name in used_names:
+                    suffix += 1
+                    name = f"{base_name}-{suffix}"
+            cli_names[index] = name
+            used_names.add(name)
+
+    for tool, name in zip(tools, cli_names):
         desc = tool.get("description", "")
         schema = tool.get("inputSchema", {})
         required_fields = set(schema.get("required", []))
@@ -1969,7 +2010,7 @@ def _build_graphql_document(
     else:
         variables = {}
         for p in cmd.params:
-            val = getattr(args, p.name.replace("-", "_"), None)
+            val = getattr(args, _param_dest(p), None)
             if val is not None:
                 variables[p.original_name] = coerce_value(val, p.schema)
 
@@ -2503,6 +2544,7 @@ def build_argparse(
             help=escape_argparse_help(cmd.description),
             description=escape_argparse_help(cmd.description),
         )
+        _allocate_param_cli_names(cmd)
         sub.set_defaults(_cmd=cmd)
 
         if cmd.has_body:
@@ -2513,20 +2555,8 @@ def build_argparse(
                 help="Read JSON body/arguments from stdin",
             )
 
-        seen_flags: set[str] = set()
         for p in cmd.params:
-            flag = f"--{p.name}"
-            # argparse owns --help on every subparser and mcp2cli owns --stdin;
-            # a tool property with one of these names raised "conflicting option
-            # string" while building the parser, which killed *every* command on
-            # that server, not just the offending tool. Rename the flag but pin
-            # dest so argument collection (getattr(args, p.name)) still finds it.
-            renamed = p.name in ("help", "stdin")
-            if renamed:
-                flag = f"--arg-{p.name}"
-            if flag in seen_flags:
-                continue  # skip duplicate param names (e.g. path + body both have same name)
-            seen_flags.add(flag)
+            flag = f"--{p.cli_name or p.name}"
             kwargs: dict = {}
             if p.python_type is not None:
                 kwargs["type"] = p.python_type
@@ -2544,8 +2574,7 @@ def build_argparse(
             kwargs["help"] = escape_argparse_help(p.description)
             if p.choices:
                 kwargs["choices"] = p.choices
-            if renamed:
-                kwargs["dest"] = p.name.replace("-", "_")
+            kwargs["dest"] = _param_dest(p)
             sub.add_argument(flag, **kwargs)
 
     return parser
@@ -2674,13 +2703,13 @@ def _collect_openapi_params(
 
     for p in cmd.params:
         if p.location == "path":
-            val = getattr(args, p.name.replace("-", "_"), None)
+            val = getattr(args, _param_dest(p), None)
             if val is not None:
                 path = path.replace(f"{{{p.original_name}}}", str(val))
 
     if cmd.method == "get":
         for p in cmd.params:
-            val = getattr(args, p.name.replace("-", "_"), None)
+            val = getattr(args, _param_dest(p), None)
             if val is None:
                 continue
             if p.location == "query":
@@ -2693,7 +2722,7 @@ def _collect_openapi_params(
         else:
             body = {}
             for p in cmd.params:
-                val = getattr(args, p.name.replace("-", "_"), None)
+                val = getattr(args, _param_dest(p), None)
                 if p.location == "header":
                     if val is not None:
                         extra_headers[p.original_name] = str(val)
@@ -2718,7 +2747,7 @@ def _collect_openapi_params(
         # Also collect query params for non-GET
         for p in cmd.params:
             if p.location == "query":
-                val = getattr(args, p.name.replace("-", "_"), None)
+                val = getattr(args, _param_dest(p), None)
                 if val is not None:
                     query_params[p.original_name] = coerce_value(val, p.schema)
 
@@ -2803,13 +2832,21 @@ def execute_openapi(
 # ---------------------------------------------------------------------------
 
 
-def _exc_message(exc: BaseException) -> str:
-    """Flatten an exception — incl. anyio ExceptionGroups — into one message."""
+def _exc_leaves(exc: BaseException) -> list[BaseException]:
+    """Flatten nested exception groups into their leaf exceptions."""
     nested = getattr(exc, "exceptions", None)
-    if nested:
-        parts = [_exc_message(e) for e in nested]
-        return "; ".join(p for p in parts if p) or exc.__class__.__name__
-    return str(exc) or exc.__class__.__name__
+    if not nested:
+        return [exc]
+    return [leaf for child in nested for leaf in _exc_leaves(child)]
+
+
+def _exc_message(exc: BaseException) -> str:
+    """Flatten an exception group into one terminal-safe line."""
+    parts = []
+    for leaf in _exc_leaves(exc):
+        message = str(leaf) or leaf.__class__.__name__
+        parts.append("; ".join(line.strip() for line in message.splitlines() if line.strip()))
+    return "; ".join(part for part in parts if part) or exc.__class__.__name__
 
 
 def _run_mcp_clean(fn, source: str):
@@ -2826,6 +2863,9 @@ def _run_mcp_clean(fn, source: str):
     except KeyboardInterrupt:  # pragma: no cover - interactive only
         raise
     except BaseException as exc:
+        leaves = _exc_leaves(exc)
+        if len(leaves) == 1 and isinstance(leaves[0], (SystemExit, KeyboardInterrupt)):
+            raise leaves[0]
         if os.environ.get("MCP2CLI_DEBUG"):
             raise
         message = _exc_message(exc)
@@ -3115,14 +3155,20 @@ async def _mcp_session(
         return 1 if _mcp_attr(result, "isError") else 0
 
     text = _extract_content_parts(result.content)
+    payload = text
+    if not payload:
+        # A tool may return only structuredContent with an empty content list.
+        structured = _mcp_attr(result, "structuredContent")
+        if structured is not None:
+            payload = structured
+
     if _mcp_attr(result, "isError"):
-        # isError is the MCP signal that the tool failed: report on stderr and
-        # exit non-zero so shell pipelines and CI can detect the failure.
-        # Return the code instead of sys.exit() — a SystemExit raised inside
-        # the anyio task group resurfaces as a BaseExceptionGroup traceback.
-        print(f"Error: {text or f'tool {tool_name!r} reported an error'}", file=sys.stderr)
+        # Return the code instead of raising inside the anyio task group, which
+        # would wrap SystemExit in a BaseExceptionGroup traceback.
+        error = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+        print(f"Error: {error or f'tool {tool_name!r} reported an error'}", file=sys.stderr)
         return 1
-    output_result(text, pretty=pretty, raw=raw, toon=toon, head=head)
+    output_result(payload, pretty=pretty, raw=raw, toon=toon, head=head)
     return 0
 
 
@@ -3379,15 +3425,17 @@ def _extract_content_parts(content_list, *, attrs=("text", "data")) -> str:
     ``name: uri`` (or just the URI) instead.
     """
     parts = []
-    for c in content_list:
+    for content in content_list:
+        is_mapping = isinstance(content, dict)
         for attr in attrs:
-            if hasattr(c, attr):
-                parts.append(getattr(c, attr))
+            value = content.get(attr) if is_mapping else getattr(content, attr, None)
+            if value is not None:
+                parts.append(value)
                 break
         else:
-            uri = getattr(c, "uri", None)
+            uri = content.get("uri") if is_mapping else getattr(content, "uri", None)
             if uri is not None:
-                name = getattr(c, "name", None)
+                name = content.get("name") if is_mapping else getattr(content, "name", None)
                 parts.append(f"{name}: {uri}" if name else str(uri))
     return "\n".join(parts) if parts else ""
 
@@ -3422,10 +3470,7 @@ async def _dispatch_list_tools(session, params):
 
 async def _dispatch_call_tool(session, params):
     result = await session.call_tool(params["name"], params.get("arguments", {}))
-    return {
-        "content": _extract_content_parts(result.content),
-        "isError": bool(_mcp_attr(result, "isError")),
-    }
+    return _mcp_dump(result)
 
 
 async def _dispatch_list_resources(session, params):
@@ -3882,7 +3927,7 @@ def handle_mcp(
     else:
         arguments = {}
         for p in cmd.params:
-            val = getattr(args, p.name.replace("-", "_"), None)
+            val = getattr(args, _param_dest(p), None)
             if val is not None:
                 arguments[p.original_name] = coerce_value(val, p.schema)
 
@@ -4476,7 +4521,7 @@ def _handle_session_operations(
     else:
         arguments = {}
         for p in cmd.params:
-            val = getattr(args, p.name.replace("-", "_"), None)
+            val = getattr(args, _param_dest(p), None)
             if val is not None:
                 arguments[p.original_name] = coerce_value(val, p.schema)
 
@@ -4484,15 +4529,28 @@ def _handle_session_operations(
         sess_name, "call_tool", {"name": cmd.tool_name, "arguments": arguments}
     )
     if isinstance(result, dict) and "isError" in result:
-        # The daemon reports the tool's isError flag; surface it like the
-        # direct path does: stderr + non-zero exit.
+        content = result.get("content") or []
+        text = _extract_content_parts(content) if isinstance(content, list) else content
+        payload = text or result.get("structuredContent") or ""
+
+        if pre_args.json_output:
+            output_result(result, **_sess_out)
+            if result.get("isError"):
+                sys.exit(1)
+            return True
+
         if result.get("isError"):
+            error = (
+                payload
+                if isinstance(payload, str)
+                else json.dumps(payload, ensure_ascii=False)
+            )
             print(
-                f"Error: {result.get('content') or f'tool {cmd.tool_name!r} reported an error'}",
+                f"Error: {error or f'tool {cmd.tool_name!r} reported an error'}",
                 file=sys.stderr,
             )
             sys.exit(1)
-        result = result["content"]
+        result = payload
     output_result(result, **_sess_out)
     return True
 
