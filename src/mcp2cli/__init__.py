@@ -1494,8 +1494,19 @@ def extract_openapi_commands(spec: dict) -> list[CommandDef]:
 
 def extract_mcp_commands(tools: list[dict]) -> list[CommandDef]:
     commands: list[CommandDef] = []
+    used_names: set[str] = set()
     for tool in tools:
         name = to_kebab(tool.get("name", "unknown"))
+        # Two tools can kebab-case to the same CLI name (get_user + getUser).
+        # argparse raises "conflicting subparser" and bricks the whole CLI, so
+        # de-duplicate here; the original name is still sent on the wire via
+        # tool_name.
+        if name in used_names:
+            suffix = 2
+            while f"{name}-{suffix}" in used_names:
+                suffix += 1
+            name = f"{name}-{suffix}"
+        used_names.add(name)
         desc = tool.get("description", "")
         schema = tool.get("inputSchema", {})
         required_fields = set(schema.get("required", []))
