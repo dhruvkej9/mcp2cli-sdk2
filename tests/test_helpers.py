@@ -10,6 +10,7 @@ from mcp2cli import (
     CommandDef,
     _apply_head,
     _collect_openapi_params,
+    _extract_content_parts,
     _find_toon_cli,
     _list_all_tools,
     _split_at_subcommand,
@@ -667,3 +668,19 @@ class TestListAllTools:
         session = _FakeSession([(None, _FakePage([], next_cursor=None))])
         tools = asyncio.run(_list_all_tools(session))
         assert tools == []
+
+
+class TestExtractContentParts:
+    def test_resource_link_block_is_rendered(self):
+        """resource_link blocks carry only uri/name and must not be dropped."""
+        from types import SimpleNamespace
+
+        text_block = SimpleNamespace(text="see:")
+        link = SimpleNamespace(uri="probe://linked", name="linked-doc")
+        assert _extract_content_parts([text_block, link]) == "see:\nlinked-doc: probe://linked"
+
+    def test_resource_link_without_name(self):
+        from types import SimpleNamespace
+
+        link = SimpleNamespace(uri="probe://linked")
+        assert _extract_content_parts([link]) == "probe://linked"
