@@ -54,6 +54,12 @@ class TestSchemaTypeToPython:
     def test_missing_type(self):
         assert schema_type_to_python({}) == (str, "")
 
+    def test_union_type_array_form(self):
+        # JSON Schema allows "type": ["integer", "null"]
+        assert schema_type_to_python({"type": ["integer", "null"]}) == (int, "")
+        assert schema_type_to_python({"type": ["number", "null"]}) == (float, "")
+        assert schema_type_to_python({"type": ["string", "null"]}) == (str, "")
+
 
 class TestCoerceValue:
     def test_none(self):
@@ -64,6 +70,11 @@ class TestCoerceValue:
 
     def test_number(self):
         assert coerce_value("3.14", {"type": "number"}) == 3.14
+
+    def test_union_type_array_form(self):
+        # "type": ["integer", "null"] must still coerce to int
+        assert coerce_value("42", {"type": ["integer", "null"]}) == 42
+        assert coerce_value("3.14", {"type": ["number", "null"]}) == 3.14
 
     def test_boolean(self):
         assert coerce_value(True, {"type": "boolean"}) is True

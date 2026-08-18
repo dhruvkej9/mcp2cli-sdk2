@@ -178,8 +178,17 @@ def read_stdin_json(context: str):
         sys.exit(1)
 
 
+def _normalize_schema_type(t):
+    """JSON Schema allows "type": ["integer", "null"] (array form). Reduce it
+    to the single concrete type, dropping "null"; anything else passes through."""
+    if isinstance(t, list):
+        concrete = [x for x in t if x != "null"]
+        return concrete[0] if len(concrete) == 1 else None
+    return t
+
+
 def schema_type_to_python(schema: dict) -> tuple[type | None, str]:
-    t = schema.get("type")
+    t = _normalize_schema_type(schema.get("type"))
     if t == "integer":
         return int, ""
     if t == "number":
@@ -207,7 +216,7 @@ def _coerce_item(value: str, item_type: str | None):
 def coerce_value(value, schema: dict):
     if value is None:
         return None
-    t = schema.get("type")
+    t = _normalize_schema_type(schema.get("type"))
     if t == "array":
         if isinstance(value, list):
             return value
@@ -218,7 +227,7 @@ def coerce_value(value, schema: dict):
                     return parsed
             except (json.JSONDecodeError, TypeError):
                 pass
-            item_type = schema.get("items", {}).get("type")
+            item_type = _normalize_schema_type(schema.get("items", {}).get("type"))
             if "," in value:
                 return [_coerce_item(v.strip(), item_type) for v in value.split(",")]
             return [_coerce_item(value, item_type)]
