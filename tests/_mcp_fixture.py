@@ -73,9 +73,26 @@ TOOLS = [
         },
     },
     {
+        "name": "fail",
+        "description": "Always fails with isError (for exit-code tests)",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "struct_only",
         "description": "Returns only structuredContent (empty content list)",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "reserved_args",
+        "description": "Accepts properties that collide with CLI flags",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "help": {"type": "string"},
+                "stdin": {"type": "boolean"},
+                "arg_stdin": {"type": "string"},
+            },
+        },
     },
 ]
 
@@ -156,10 +173,17 @@ def _call_tool(name: str, arguments: dict) -> dict:
             "refresh": arguments.get("refresh", False),
         }
         return {"content": [_text(json.dumps(payload))], "isError": False}
+    if name == "fail":
+        return {"content": [_text("boom: deliberate failure")], "isError": True}
     if name == "struct_only":
         return {
             "content": [],
             "structuredContent": {"answer": 42},
+            "isError": False,
+        }
+    if name == "reserved_args":
+        return {
+            "content": [_text(json.dumps(arguments, sort_keys=True))],
             "isError": False,
         }
     return {"content": [_text(f"Unknown tool: {name}")], "isError": True}

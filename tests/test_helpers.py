@@ -10,6 +10,7 @@ from mcp2cli import (
     CommandDef,
     _apply_head,
     _collect_openapi_params,
+    _extract_content_parts,
     _find_toon_cli,
     _list_all_tools,
     _split_at_subcommand,
@@ -53,6 +54,27 @@ class TestSchemaTypeToPython:
     def test_missing_type(self):
         assert schema_type_to_python({}) == (str, "")
 
+    def test_union_type_array_form(self):
+        # JSON Schema allows "type": ["integer", "null"]
+        assert schema_type_to_python({"type": ["integer", "null"]}) == (int, "")
+        assert schema_type_to_python({"type": ["number", "null"]}) == (float, "")
+        assert schema_type_to_python({"type": ["string", "null"]}) == (str, "")
+
+    def test_missing_type_int_enum_inferred(self):
+        # No "type" but a numeric enum: argparse must parse the flag as int or
+        # it rejects the value against numeric choices.
+        assert schema_type_to_python({"enum": [1, 2, 3]}) == (int, "")
+
+    def test_missing_type_float_enum_inferred(self):
+        assert schema_type_to_python({"enum": [0.5, 1.5]}) == (float, "")
+
+    def test_missing_type_string_enum_stays_str(self):
+        assert schema_type_to_python({"enum": ["a", "b"]}) == (str, "")
+
+    def test_missing_type_bool_enum_not_inferred(self):
+        # bool is a subclass of int; don't misread a bool enum as int
+        assert schema_type_to_python({"enum": [True, False]}) == (str, "")
+
 
 class TestCoerceValue:
     def test_none(self):
@@ -63,6 +85,18 @@ class TestCoerceValue:
 
     def test_number(self):
         assert coerce_value("3.14", {"type": "number"}) == 3.14
+
+    def test_union_type_array_form(self):
+        # "type": ["integer", "null"] must still coerce to int
+        assert coerce_value("42", {"type": ["integer", "null"]}) == 42
+        assert coerce_value("3.14", {"type": ["number", "null"]}) == 3.14
+
+    def test_array_items_union_type(self):
+        schema = {
+            "type": "array",
+            "items": {"type": ["integer", "null"]},
+        }
+        assert coerce_value("1,2", schema) == [1, 2]
 
     def test_boolean(self):
         assert coerce_value(True, {"type": "boolean"}) is True
@@ -425,6 +459,85 @@ class TestExtractMCPCommands:
         assert cmds[0].name == "list-items"
         assert cmds[0].tool_name == "list_items"
 
+    def test_kebab_collision_deduplicated(self):
+        """get_user + getUser both kebab to get-user; argparse would raise
+        'conflicting subparser' and brick the CLI. Names must be unique while
+        tool_name keeps the original wire name."""
+        tools = [
+            {"name": "get_user", "description": "snake", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "getUser", "description": "camel", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "get-user", "description": "kebab", "inputSchema": {"type": "object", "properties": {}}},
+        ]
+        cmds = extract_mcp_commands(tools)
+        names = [c.name for c in cmds]
+        assert len(set(names)) == 3
+        assert [c.tool_name for c in cmds] == ["get_user", "getUser", "get-user"]
+
+    def test_collision_aliases_are_stable_and_preserve_natural_names(self):
+        tools = [
+            {"name": "get_user", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "getUser", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "get_user_2", "inputSchema": {"type": "object", "properties": {}}},
+        ]
+        first = {cmd.tool_name: cmd.name for cmd in extract_mcp_commands(tools)}
+        reordered = {
+            cmd.tool_name: cmd.name for cmd in extract_mcp_commands(list(reversed(tools)))
+        }
+        assert first == reordered
+        assert first["get_user_2"] == "get-user-2"
+
+
+class TestBuildArgparseReservedFlags:
+    """A tool property named help/stdin used to raise 'conflicting option
+    string' during parser build, killing every command on that server."""
+
+    def _build(self, props):
+        from mcp2cli import build_argparse
+
+        tools = [
+            {
+                "name": "weird",
+                "description": "reserved props",
+                "inputSchema": {"type": "object", "properties": props},
+            }
+        ]
+        pre = argparse.ArgumentParser(add_help=False)
+        return build_argparse(extract_mcp_commands(tools), pre)
+
+    def test_help_property_does_not_brick_parser(self):
+        parser = self._build({"help": {"type": "string"}})
+        args = parser.parse_args(["weird", "--arg-help", "h1"])
+        assert args.arg_help == "h1"
+
+    def test_stdin_property_has_distinct_destination(self):
+        parser = self._build({"stdin": {"type": "string"}})
+        args = parser.parse_args(["weird", "--arg-stdin", "s1"])
+        assert args.stdin is False
+        assert args.arg_stdin == "s1"
+
+        stdin_args = parser.parse_args(["weird", "--stdin"])
+        assert stdin_args.stdin is True
+        assert stdin_args.arg_stdin is None
+
+    def test_boolean_stdin_property_does_not_trigger_stdin_mode(self):
+        parser = self._build({"stdin": {"type": "boolean"}})
+        args = parser.parse_args(["weird", "--arg-stdin"])
+        assert args.stdin is False
+        assert args.arg_stdin is True
+
+    def test_reserved_alias_does_not_shadow_natural_property(self):
+        parser = self._build(
+            {
+                "help": {"type": "string"},
+                "arg_help": {"type": "string"},
+            }
+        )
+        args = parser.parse_args(
+            ["weird", "--arg-help-2", "reserved", "--arg-help", "natural"]
+        )
+        assert args.arg_help_2 == "reserved"
+        assert args.arg_help == "natural"
+
 
 class TestSplitAtSubcommand:
     """Tests for _split_at_subcommand() — GH #15."""
@@ -667,3 +780,26 @@ class TestListAllTools:
         session = _FakeSession([(None, _FakePage([], next_cursor=None))])
         tools = asyncio.run(_list_all_tools(session))
         assert tools == []
+
+
+class TestExtractContentParts:
+    def test_resource_link_block_is_rendered(self):
+        """resource_link blocks carry only uri/name and must not be dropped."""
+        from types import SimpleNamespace
+
+        text_block = SimpleNamespace(text="see:")
+        link = SimpleNamespace(uri="probe://linked", name="linked-doc")
+        assert _extract_content_parts([text_block, link]) == "see:\nlinked-doc: probe://linked"
+
+    def test_resource_link_without_name(self):
+        from types import SimpleNamespace
+
+        link = SimpleNamespace(uri="probe://linked")
+        assert _extract_content_parts([link]) == "probe://linked"
+
+    def test_serialized_content_blocks_are_rendered(self):
+        blocks = [
+            {"type": "text", "text": "see:"},
+            {"type": "resource_link", "uri": "probe://linked", "name": "linked-doc"},
+        ]
+        assert _extract_content_parts(blocks) == "see:\nlinked-doc: probe://linked"
