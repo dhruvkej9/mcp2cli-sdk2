@@ -237,6 +237,8 @@ Filtering options:
 
 Configs are stored in `~/.config/mcp2cli/baked.json`. Override with `MCP2CLI_CONFIG_DIR`.
 
+`bake show` masks the credential values it knows about — the OAuth client secret and every `--auth-header` value — while leaving `env:`/`file:` references readable so the config stays diagnosable. Values baked in with `--env` are printed as stored, so scrub those before pasting the output if an env var carries a token.
+
 ### Usage-aware tool ranking
 
 mcp2cli tracks tool invocations locally and uses that data to rank `--list` output, reducing token costs for LLM agents working with large servers.
