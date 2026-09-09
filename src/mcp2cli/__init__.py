@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from datetime import datetime, timezone
 
@@ -1349,22 +1349,61 @@ def _json_pointer_unescape(token: str) -> str:
     return token.replace("~1", "/").replace("~0", "~")
 
 
+def _json_pointer_tokens(raw: str) -> tuple[str, ...]:
+    """Candidate decodings of one reference token, most literal first.
+
+    A ``$ref`` is a URI, so RFC 6901 section 6 percent-encodes the pointer it
+    carries in the fragment: a legal reference to a schema named ``Pet Dog``
+    arrives as ``Pet%20Dog``, and a path item ``/pets/{id}`` as
+    ``~1pets~1%7Bid%7D``. Percent-decoding runs first, since it was applied
+    over the ``~`` escaping. Plenty of hand-written specs skip the encoding
+    step, so the literal token is tried before the decoded one -- a component
+    genuinely named ``Pet%20Dog`` still resolves, and specs that encoded
+    nothing behave exactly as they did before.
+    """
+    literal = _json_pointer_unescape(raw)
+    decoded = _json_pointer_unescape(unquote(raw))
+    return (literal,) if decoded == literal else (literal, decoded)
+
+
+# RFC 6901: an array index is "0", or a digit string with no leading zero.
+# ``int()`` is far more generous -- it accepts "-1" (which would silently
+# select the *last* element), "+1", "01", " 1 ", "1_0" and Unicode digits --
+# so a token is screened before conversion.
+_ARRAY_INDEX_RE = re.compile(r"0|[1-9][0-9]*")
+# No list holds 10**19 items, so a longer digit run is out of range by
+# inspection. Checking the length first also keeps a pathological token away
+# from int(), whose behaviour on huge digit strings hangs on CPython's
+# integer-string conversion limit rather than on anything we control.
+_ARRAY_INDEX_MAX_DIGITS = 19
+
+
+def _array_index(token: str, length: int) -> int | None:
+    """Index *token* addresses in a list of *length*, or None if it does not."""
+    if len(token) > _ARRAY_INDEX_MAX_DIGITS or not _ARRAY_INDEX_RE.fullmatch(token):
+        return None
+    index = int(token)
+    return index if index < length else None
+
+
 def _json_pointer_lookup(root, pointer_tokens: list[str]):
     """Walk *root* by JSON Pointer tokens. Raises LookupError when it dangles."""
     target = root
     for raw in pointer_tokens:
-        token = _json_pointer_unescape(raw)
-        if isinstance(target, dict):
-            if token not in target:
-                raise LookupError(token)
-            target = target[token]
-        elif isinstance(target, list):
-            try:
-                target = target[int(token)]
-            except (ValueError, IndexError):
-                raise LookupError(token) from None
+        for token in _json_pointer_tokens(raw):
+            if isinstance(target, dict):
+                if token in target:
+                    target = target[token]
+                    break
+            elif isinstance(target, list):
+                index = _array_index(token, len(target))
+                if index is not None:
+                    target = target[index]
+                    break
+            else:
+                raise LookupError(raw)
         else:
-            raise LookupError(token)
+            raise LookupError(raw)
     return target
 
 
@@ -1389,8 +1428,12 @@ def resolve_refs(spec: dict) -> dict:
                         # produce -- and say so once.
                         if ref not in warned:
                             warned.add(ref)
+                            # A ref is spec-controlled and can be arbitrarily
+                            # long, so keep the diagnostic to one readable
+                            # line instead of echoing the whole token.
+                            shown = ref if len(ref) <= 200 else ref[:200] + "..."
                             print(
-                                f"Warning: unresolvable $ref {ref!r} in spec; "
+                                f"Warning: unresolvable $ref {shown!r} in spec; "
                                 "leaving it unresolved.",
                                 file=sys.stderr,
                             )

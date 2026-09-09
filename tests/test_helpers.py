@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import shutil
+import sys
 
 from mcp2cli import (
     ParamDef,
@@ -815,7 +816,16 @@ class TestExtractContentParts:
 class TestResolveRefsRobustness:
     """A spec we did not write must not crash ref resolution."""
 
-    def test_dangling_ref_does_not_raise(self, capsys):
+    @staticmethod
+    def _spec(ref, **root):
+        """A spec whose only ``$ref`` sits at paths./x.get.schema."""
+        return {"paths": {"/x": {"get": {"schema": {"$ref": ref}}}}, **root}
+
+    @staticmethod
+    def _schema(resolved):
+        return resolved["paths"]["/x"]["get"]["schema"]
+
+    def test_dangling_ref_is_left_unresolved_and_named(self, capsys):
         spec = {
             "paths": {
                 "/x": {
@@ -832,46 +842,120 @@ class TestResolveRefsRobustness:
         assert resolved["paths"]["/x"]["get"]["parameters"][0] == {
             "$ref": "#/components/parameters/Missing"
         }
-        err = capsys.readouterr().err
-        assert "unresolvable $ref" in err
-        assert "#/components/parameters/Missing" in err
+        assert "#/components/parameters/Missing" in capsys.readouterr().err
 
-    def test_dangling_ref_warns_once(self, capsys):
+    def test_dangling_ref_reported_once_per_ref(self, capsys):
         ref = {"$ref": "#/nope"}
         spec = {"paths": {"/a": {"get": {"x": dict(ref)}},
                           "/b": {"get": {"x": dict(ref)}}}}
         resolve_refs(spec)
-        assert capsys.readouterr().err.count("unresolvable $ref") == 1
+        assert capsys.readouterr().err.count("#/nope") == 1
+
+    def test_resolvable_ref_is_silent(self, capsys):
+        spec = self._spec("#/components/Ok", components={"Ok": {"type": "integer"}})
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
+        assert capsys.readouterr().err == ""
 
     def test_json_pointer_escapes_are_decoded(self):
         # RFC 6901: ~1 -> /  and  ~0 -> ~
-        spec = {
-            "components": {"a/b": {"c~d": {"type": "integer"}}},
-            "paths": {
-                "/x": {
-                    "get": {
-                        "schema": {"$ref": "#/components/a~1b/c~0d"}
-                    }
-                }
-            },
-        }
-        resolved = resolve_refs(spec)
-        assert resolved["paths"]["/x"]["get"]["schema"] == {"type": "integer"}
+        spec = self._spec(
+            "#/components/a~1b/c~0d",
+            components={"a/b": {"c~d": {"type": "integer"}}},
+        )
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
 
-    def test_array_index_tokens(self):
+    def test_tilde_escape_decoding_order(self):
+        # ~01 is the literal name "~1", never the separator "/".
+        spec = self._spec(
+            "#/components/~01",
+            components={"~1": {"type": "integer"}, "/": {"type": "string"}},
+        )
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
+
+    def test_array_index_tokens_resolve(self):
+        shared = [{"type": "string"}, {"type": "integer"}]
+        assert self._schema(
+            resolve_refs(self._spec("#/shared/0", shared=shared))
+        ) == {"type": "string"}
+        assert self._schema(
+            resolve_refs(self._spec("#/shared/1", shared=shared))
+        ) == {"type": "integer"}
+
+    def test_malformed_array_indices_select_nothing(self):
+        # int() would take every one of these -- "-1" would hand back the
+        # *last* element, "01"/" 1"/"1_0"/"\u0661" some other element.
+        for token in ["-1", "+1", "01", " 1", "1 ", "1_0", "\u0661", "1.0", ""]:
+            ref = f"#/shared/{token}"
+            spec = self._spec(ref, shared=[{"type": "string"}, {"type": "integer"}])
+            assert self._schema(resolve_refs(spec)) == {"$ref": ref}, token
+
+    def test_out_of_range_array_index_selects_nothing(self):
+        spec = self._spec("#/shared/2", shared=[{"type": "string"}])
+        assert self._schema(resolve_refs(spec)) == {"$ref": "#/shared/2"}
+
+    def test_huge_index_token_does_not_depend_on_int_limit(self, capsys):
+        ref = "#/shared/" + "9" * 6000
+        spec = self._spec(ref, shared=[{"type": "string"}])
+        limit = sys.get_int_max_str_digits()
+        sys.set_int_max_str_digits(0)  # 0 disables CPython's conversion guard
+        try:
+            resolved = resolve_refs(spec)
+        finally:
+            sys.set_int_max_str_digits(limit)
+        assert self._schema(resolved) == {"$ref": ref}
+        # A spec-controlled ref must not flood stderr with one huge line.
+        err = capsys.readouterr().err
+        assert 0 < len(err) < 400, len(err)
+
+    def test_numeric_and_signed_dict_keys_still_resolve(self):
+        # Array-index screening must not reach dict keys, which are plain
+        # strings: OpenAPI response maps are keyed "200", "404", ...
+        spec = self._spec(
+            "#/responses/200",
+            responses={"200": {"type": "integer"}, "-1": {"type": "string"}},
+        )
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
+        spec = self._spec(
+            "#/responses/-1",
+            responses={"200": {"type": "integer"}, "-1": {"type": "string"}},
+        )
+        assert self._schema(resolve_refs(spec)) == {"type": "string"}
+
+    def test_percent_encoded_fragment_resolves(self):
+        # RFC 6901 section 6: a pointer inside a URI fragment is
+        # percent-encoded, so a space arrives as %20 and "{" as %7B.
+        spec = self._spec(
+            "#/components/Pet%20Dog",
+            components={"Pet Dog": {"type": "integer"}},
+        )
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
+        # "{" and "}" are not legal fragment characters either, so a legal
+        # ref to a templated path item arrives as ~1pets~1%7Bid%7D.
         spec = {
-            "shared": [{"type": "string"}, {"type": "integer"}],
             "paths": {
-                "/x": {"get": {"schema": {"$ref": "#/shared/1"}}}
-            },
+                "/pets/{id}": {"get": {"type": "integer"}},
+                "/x": {
+                    "get": {"schema": {"$ref": "#/paths/~1pets~1%7Bid%7D/get"}}
+                },
+            }
         }
-        resolved = resolve_refs(spec)
-        assert resolved["paths"]["/x"]["get"]["schema"] == {"type": "integer"}
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
+
+    def test_literal_percent_name_wins_over_decoded_one(self):
+        spec = self._spec(
+            "#/components/Pet%20Dog",
+            components={
+                "Pet%20Dog": {"type": "integer"},
+                "Pet Dog": {"type": "string"},
+            },
+        )
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
 
     def test_ref_through_non_container_is_unresolved(self):
-        spec = {
-            "leaf": 42,
-            "paths": {"/x": {"get": {"schema": {"$ref": "#/leaf/deeper"}}}},
-        }
-        resolved = resolve_refs(spec)
-        assert resolved["paths"]["/x"]["get"]["schema"] == {"$ref": "#/leaf/deeper"}
+        spec = self._spec("#/leaf/deeper", leaf=42)
+        assert self._schema(resolve_refs(spec)) == {"$ref": "#/leaf/deeper"}
+
+    def test_external_ref_is_left_intact(self, capsys):
+        spec = self._spec("other.yaml#/components/Pet")
+        assert self._schema(resolve_refs(spec)) == {"$ref": "other.yaml#/components/Pet"}
+        assert capsys.readouterr().err == ""
